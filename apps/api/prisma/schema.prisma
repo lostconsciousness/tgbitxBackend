@@ -1,0 +1,1207 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum Chain {
+  ARBITRUM
+  ARBITRUM_SEPOLIA
+  ETHEREUM
+  BASE
+  OPTIMISM
+  POLYGON
+  BNB
+  AVALANCHE
+  SOLANA
+  BITCOIN
+  TRON
+  ETHEREUM_SEPOLIA
+  BASE_SEPOLIA
+  OPTIMISM_SEPOLIA
+  POLYGON_AMOY
+  BNB_TESTNET
+  AVALANCHE_FUJI
+  SOLANA_DEVNET
+  BITCOIN_SIGNET
+  TRON_NILE
+  TRON_SHASTA
+  ZKSYNC
+  ZKSYNC_SEPOLIA
+  LINEA
+  LINEA_SEPOLIA
+  SCROLL
+  SCROLL_SEPOLIA
+  MANTLE
+  MANTLE_SEPOLIA
+  CELO
+  CELO_ALFAJORES
+}
+
+enum NetworkFamily {
+  EVM
+  SVM
+  UTXO
+  TVM
+}
+
+enum TokenStandard {
+  NATIVE
+  ERC20
+  SPL
+  BTC
+  TRC20
+}
+
+enum WalletType {
+  EXTERNAL
+  EMBEDDED
+}
+
+enum WalletProvider {
+  SIWE
+  PRIVY
+}
+
+enum WalletStatus {
+  ACTIVE
+  REVOKED
+}
+
+enum AssetType {
+  CRYPTO
+  STABLECOIN
+}
+
+enum MarketType {
+  SPOT
+  PERP
+}
+
+enum MarketStatus {
+  ACTIVE
+  PAUSED
+  DISABLED
+}
+
+enum LedgerAccountType {
+  USER_SPOT
+  USER_PERP_MARGIN
+  PLATFORM_FEES
+  PLATFORM_BBOOK
+  PLATFORM_RISK
+  PENDING_DEPOSIT
+  PENDING_WITHDRAWAL
+  PROVIDER_CLEARING
+  GAS_FEES
+  REFERRAL
+  INSURANCE
+}
+
+enum LedgerEntryDirection {
+  DEBIT
+  CREDIT
+}
+
+enum LedgerTransactionType {
+  DEPOSIT_CREDIT
+  WITHDRAWAL_RESERVE
+  WITHDRAWAL_RELEASE
+  WITHDRAWAL_FEE
+  MARGIN_RESERVE
+  MARGIN_RELEASE
+  SPOT_RESERVE
+  SPOT_RELEASE
+  SPOT_TRADE
+  CONVERT_RESERVE
+  CONVERT_RELEASE
+  CONVERT_TRADE
+  TRADE_PNL
+  TRADING_FEE
+  FUNDING
+  LIQUIDATION
+  TREASURY_TRANSFER
+  ADMIN_ADJUSTMENT
+}
+
+enum ConversionProvider {
+  ONEINCH
+  INTERNAL_RESERVE
+  CEX
+}
+
+enum ConversionQuoteStatus {
+  ACTIVE
+  CONSUMED
+  EXPIRED
+}
+
+enum ConversionStatus {
+  PENDING
+  EXECUTING
+  FILLED
+  FAILED
+  CANCELLED
+}
+
+enum LedgerTransactionStatus {
+  POSTED
+  VOIDED
+}
+
+enum DepositStatus {
+  DETECTED
+  PENDING_CONFIRMATION
+  CREDITED
+  DUPLICATE
+  UNMATCHED
+  FAILED
+}
+
+enum DepositChannel {
+  PERSONAL_ADDRESS
+  WEB3_INTENT
+  UNMATCHED
+}
+
+enum UserDepositAddressStatus {
+  PROVISIONING
+  ACTIVE
+  PAUSED
+  FAILED
+}
+
+enum DepositSweepStatus {
+  PENDING
+  FUNDING_GAS
+  BROADCASTING
+  BROADCASTED
+  CONFIRMED
+  BLOCKED
+  FAILED
+}
+
+enum WithdrawalStatus {
+  REQUESTED
+  RISK_CHECK
+  PENDING_APPROVAL
+  APPROVED
+  BROADCASTING
+  BROADCASTED
+  CONFIRMED
+  REJECTED
+  FAILED
+  CANCELLED
+}
+
+enum ReconciliationType {
+  LEDGER_BALANCE
+  DEPOSIT_INDEXER
+  WITHDRAWAL_STATUS
+  TREASURY_BALANCE
+  PROVIDER_BALANCE
+  PROVIDER_ORDERS
+  PROVIDER_POSITIONS
+  BBOOK_EXPOSURE
+}
+
+enum ReconciliationStatus {
+  RUNNING
+  PASSED
+  FAILED
+}
+
+enum DepositIntentStatus {
+  PENDING
+  SUBMITTED
+  DETECTED
+  CONFIRMED
+  CREDITED
+  EXPIRED
+  FAILED
+  CANCELLED
+}
+
+enum CustodyAccountRole {
+  DEPOSIT_TREASURY
+  WITHDRAWAL_HOT
+  SWEEP_GAS
+  SAFE_RESERVE
+  HYPERLIQUID_COLLATERAL
+  PLATFORM_CAPITAL
+  INSURANCE
+}
+
+enum CustodyProvider {
+  PRIVY
+  SAFE
+  HYPERLIQUID
+  EXTERNAL
+}
+
+enum CustodyAccountStatus {
+  ACTIVE
+  PAUSED
+  DISABLED
+}
+
+enum TreasuryTransferStatus {
+  PROPOSED
+  APPROVED
+  BROADCASTING
+  BROADCASTED
+  CONFIRMED
+  REJECTED
+  FAILED
+}
+
+enum OrderSide {
+  BUY
+  SELL
+}
+
+enum OrderType {
+  MARKET
+  LIMIT
+  STOP_LOSS
+  TAKE_PROFIT
+}
+
+enum OrderStatus {
+  CREATED
+  VALIDATED
+  REJECTED
+  ROUTED
+  PROVIDER_PENDING
+  OPEN
+  PARTIALLY_FILLED
+  FILLED
+  CANCELLED
+  EXPIRED
+  FAILED
+  FORCE_CLOSED
+  LIQUIDATED
+}
+
+enum ExecutionRoute {
+  A_BOOK_HYPERLIQUID
+  B_BOOK_INTERNAL
+}
+
+enum PositionSide {
+  LONG
+  SHORT
+}
+
+enum PositionStatus {
+  OPEN
+  CLOSED
+  LIQUIDATED
+}
+
+enum MarginMode {
+  ISOLATED
+}
+
+enum ProviderOrderStatus {
+  PENDING
+  OPEN
+  PARTIALLY_FILLED
+  FILLED
+  CANCELLED
+  FAILED
+  RECONCILIATION_REQUIRED
+}
+
+enum LiquidationStatus {
+  TRIGGERED
+  CLOSING
+  COMPLETED
+  FAILED
+}
+
+model User {
+  id                  String              @id @default(cuid())
+  email               String              @unique
+  passwordHash        String
+  role                UserRole            @default(USER)
+  status              UserStatus          @default(ACTIVE)
+  sessions            Session[]
+  wallets             Wallet[]
+  walletNonces        WalletSiweNonce[]
+  ledgerAccounts      LedgerAccount[]
+  balanceSnapshots    BalanceSnapshot[]
+  deposits            Deposit[]
+  depositIntents      DepositIntent[]
+  depositAddresses    UserDepositAddress[]
+  withdrawals         Withdrawal[]        @relation("WithdrawalOwner")
+  orders              Order[]
+  trades              Trade[]
+  conversionQuotes    ConversionQuote[]
+  conversions         Conversion[]
+  positions           Position[]
+  approvedWithdrawals Withdrawal[]        @relation("WithdrawalApprover")
+  rejectedWithdrawals Withdrawal[]        @relation("WithdrawalRejector")
+  withdrawalAddresses WithdrawalAddress[]
+  auditLogs           AuditLog[]          @relation("AuditActor")
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  @@map("users")
+}
+
+model Session {
+  id               String    @id @default(cuid())
+  userId           String
+  refreshTokenHash String
+  userAgent        String?
+  ipAddress        String?
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  lastUsedAt       DateTime  @default(now())
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model Wallet {
+  id                String          @id @default(cuid())
+  userId            String
+  chain             Chain           @default(ARBITRUM)
+  type              WalletType      @default(EXTERNAL)
+  provider          WalletProvider  @default(SIWE)
+  address           String
+  providerUserRef   String?
+  providerWalletRef String?         @unique
+  label             String?
+  status            WalletStatus    @default(ACTIVE)
+  isPrimary         Boolean         @default(false)
+  verifiedAt        DateTime?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  user              User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deposits          Deposit[]
+  depositIntents    DepositIntent[]
+
+  @@unique([chain, address])
+  @@index([userId, status])
+  @@index([provider, providerUserRef])
+  @@index([address])
+  @@map("wallets")
+}
+
+model WalletSiweNonce {
+  id        String    @id @default(cuid())
+  userId    String?
+  address   String
+  nonce     String    @unique
+  domain    String
+  uri       String
+  chainId   Int
+  message   String
+  issuedAt  DateTime
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  user      User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([address])
+  @@index([expiresAt])
+  @@map("wallet_siwe_nonces")
+}
+
+model Asset {
+  id                  String                   @id @default(cuid())
+  symbol              String                   @unique
+  name                String
+  iconUrl             String?
+  type                AssetType
+  chain               Chain                    @default(ARBITRUM)
+  tokenAddress        String?                  @unique
+  decimals            Int
+  depositEnabled      Boolean                  @default(true)
+  withdrawalEnabled   Boolean                  @default(false)
+  withdrawalFeeAmount Decimal                  @default(0) @db.Decimal(38, 18)
+  minWithdrawalAmount Decimal                  @default(0) @db.Decimal(38, 18)
+  contractVerifiedAt  DateTime?
+  contractCodeHash    String?
+  verifiedChainId     Int?
+  createdAt           DateTime                 @default(now())
+  updatedAt           DateTime                 @updatedAt
+  baseMarkets         Market[]                 @relation("MarketBaseAsset")
+  quoteMarkets        Market[]                 @relation("MarketQuoteAsset")
+  ledgerAccounts      LedgerAccount[]
+  ledgerEntries       LedgerEntry[]
+  balanceSnapshots    BalanceSnapshot[]
+  deposits            Deposit[]
+  depositIntents      DepositIntent[]
+  withdrawals         Withdrawal[]
+  custodySnapshots    CustodyBalanceSnapshot[]
+  treasuryTransfers   TreasuryTransfer[]
+  depositSweeps       DepositSweep[]
+  tokenContracts      TokenContract[]
+  conversionQuotesFrom ConversionQuote[] @relation("ConversionQuoteFromAsset")
+  conversionQuotesTo   ConversionQuote[] @relation("ConversionQuoteToAsset")
+  conversionsFrom      Conversion[]      @relation("ConversionFromAsset")
+  conversionsTo        Conversion[]      @relation("ConversionToAsset")
+
+  @@index([chain])
+  @@map("assets")
+}
+
+model ConversionQuote {
+  id               String                @id @default(cuid())
+  userId           String
+  fromAssetId      String
+  toAssetId        String
+  provider         ConversionProvider
+  status           ConversionQuoteStatus @default(ACTIVE)
+  networkKey       String
+  fromAmount       Decimal               @db.Decimal(38, 18)
+  expectedToAmount Decimal               @db.Decimal(38, 18)
+  minToAmount      Decimal               @db.Decimal(38, 18)
+  feeAmount        Decimal               @db.Decimal(38, 18)
+  slippageBps      Int
+  expiresAt        DateTime
+  consumedAt       DateTime?
+  providerData     Json?
+  createdAt        DateTime              @default(now())
+  user             User                  @relation(fields: [userId], references: [id], onDelete: Restrict)
+  fromAsset        Asset                 @relation("ConversionQuoteFromAsset", fields: [fromAssetId], references: [id], onDelete: Restrict)
+  toAsset          Asset                 @relation("ConversionQuoteToAsset", fields: [toAssetId], references: [id], onDelete: Restrict)
+  conversion       Conversion?
+
+  @@index([userId, createdAt])
+  @@index([status, expiresAt])
+  @@map("conversion_quotes")
+}
+
+model Conversion {
+  id                 String             @id @default(cuid())
+  userId             String
+  quoteId            String             @unique
+  clientConversionId String
+  fromAssetId        String
+  toAssetId          String
+  provider           ConversionProvider
+  status             ConversionStatus   @default(PENDING)
+  networkKey         String
+  fromAmount         Decimal            @db.Decimal(38, 18)
+  expectedToAmount   Decimal            @db.Decimal(38, 18)
+  minToAmount        Decimal            @db.Decimal(38, 18)
+  actualToAmount     Decimal?           @db.Decimal(38, 18)
+  feeAmount          Decimal            @db.Decimal(38, 18)
+  approvalTxHash     String?
+  txHash             String?            @unique
+  providerRequestId  String?
+  executionData      Json?
+  attempts           Int                @default(0)
+  failureReason      String?
+  completedAt        DateTime?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  user               User               @relation(fields: [userId], references: [id], onDelete: Restrict)
+  quote              ConversionQuote    @relation(fields: [quoteId], references: [id], onDelete: Restrict)
+  fromAsset          Asset              @relation("ConversionFromAsset", fields: [fromAssetId], references: [id], onDelete: Restrict)
+  toAsset            Asset              @relation("ConversionToAsset", fields: [toAssetId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, clientConversionId])
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@map("conversions")
+}
+
+model Network {
+  id                  String                @id @default(cuid())
+  chainKey            String                @unique
+  displayName         String
+  iconUrl             String?
+  family              NetworkFamily
+  legacyChain         Chain?
+  caip2               String?               @unique
+  chainId             Int?                  @unique
+  mainnet             Boolean               @default(false)
+  rpcPrimaryEnv       String?
+  rpcFallbackEnv      String?
+  confirmations       Int                   @default(12)
+  reorgOverlapBlocks  Int                   @default(30)
+  depositEnabled      Boolean               @default(false)
+  withdrawalEnabled   Boolean               @default(false)
+  createdAt           DateTime              @default(now())
+  updatedAt           DateTime              @updatedAt
+  tokenContracts      TokenContract[]
+  depositCursors      DepositIndexerCursor[]
+
+  @@index([family, depositEnabled])
+  @@index([family, withdrawalEnabled])
+  @@map("networks")
+}
+
+model TokenContract {
+  id                  String                   @id @default(cuid())
+  assetId             String
+  networkId           String
+  standard            TokenStandard
+  address             String?
+  decimals            Int
+  depositEnabled      Boolean                  @default(false)
+  withdrawalEnabled   Boolean                  @default(false)
+  withdrawalFeeAmount Decimal                  @default(0) @db.Decimal(38, 18)
+  minWithdrawalAmount Decimal                  @default(0) @db.Decimal(38, 18)
+  contractVerifiedAt  DateTime?
+  contractCodeHash    String?
+  verifiedChainId     Int?
+  metadata            Json?
+  createdAt           DateTime                 @default(now())
+  updatedAt           DateTime                 @updatedAt
+  asset               Asset                    @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  network             Network                  @relation(fields: [networkId], references: [id], onDelete: Cascade)
+  deposits            Deposit[]
+  depositIntents      DepositIntent[]
+  withdrawals         Withdrawal[]
+  depositCursors      DepositIndexerCursor[]
+
+  @@unique([assetId, networkId, standard])
+  @@unique([networkId, address])
+  @@index([networkId, depositEnabled])
+  @@index([networkId, withdrawalEnabled])
+  @@map("token_contracts")
+}
+
+model Market {
+  id                String             @id @default(cuid())
+  symbol            String             @unique
+  type              MarketType
+  status            MarketStatus       @default(ACTIVE)
+  providerName      String?
+  providerSymbol    String?
+  tradingViewSymbol String?
+  orderbookEnabled  Boolean            @default(false)
+  baseAssetId       String
+  quoteAssetId      String
+  pricePrecision    Int
+  sizePrecision     Int
+  minOrderSize      Decimal            @default(0) @db.Decimal(38, 18)
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  baseAsset         Asset              @relation("MarketBaseAsset", fields: [baseAssetId], references: [id])
+  quoteAsset        Asset              @relation("MarketQuoteAsset", fields: [quoteAssetId], references: [id])
+  orders            Order[]
+  trades            Trade[]
+  positions         Position[]
+  providerOrders    ProviderOrder[]
+  bbookExposure     BBookExposure?
+  riskConfig        RiskConfig?
+  feeConfig         FeeConfig?
+  liquidations      LiquidationEvent[]
+
+  @@index([type, status])
+  @@index([providerName, providerSymbol])
+  @@map("markets")
+}
+
+model LedgerAccount {
+  id        String            @id @default(cuid())
+  key       String            @unique
+  type      LedgerAccountType
+  userId    String?
+  assetId   String
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+  user      User?             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  asset     Asset             @relation(fields: [assetId], references: [id], onDelete: Restrict)
+  entries   LedgerEntry[]
+
+  @@index([userId, assetId, type])
+  @@index([assetId, type])
+  @@map("ledger_accounts")
+}
+
+model LedgerTransaction {
+  id                 String                  @id @default(cuid())
+  type               LedgerTransactionType
+  status             LedgerTransactionStatus @default(POSTED)
+  idempotencyKey     String                  @unique
+  referenceType      String?
+  referenceId        String?
+  description        String?
+  metadata           Json?
+  createdAt          DateTime                @default(now())
+  entries            LedgerEntry[]
+  creditedDeposit    Deposit?                @relation("DepositCreditLedgerTransaction")
+  reservedWithdrawal Withdrawal?             @relation("WithdrawalReserveLedgerTransaction")
+  marginOrder        Order?                  @relation("OrderMarginLedgerTransaction")
+  liquidationEvent   LiquidationEvent?       @relation("LiquidationLedgerTransaction")
+
+  @@index([referenceType, referenceId])
+  @@map("ledger_transactions")
+}
+
+model LedgerEntry {
+  id            String               @id @default(cuid())
+  transactionId String
+  accountId     String
+  assetId       String
+  direction     LedgerEntryDirection
+  amount        Decimal              @db.Decimal(38, 18)
+  createdAt     DateTime             @default(now())
+  transaction   LedgerTransaction    @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  account       LedgerAccount        @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  asset         Asset                @relation(fields: [assetId], references: [id], onDelete: Restrict)
+
+  @@index([accountId])
+  @@index([assetId])
+  @@map("ledger_entries")
+}
+
+model BalanceSnapshot {
+  id        String   @id @default(cuid())
+  userId    String
+  assetId   String
+  available Decimal  @db.Decimal(38, 18)
+  total     Decimal  @db.Decimal(38, 18)
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  asset     Asset    @relation(fields: [assetId], references: [id], onDelete: Restrict)
+
+  @@index([userId, assetId, createdAt])
+  @@map("balance_snapshots")
+}
+
+model Deposit {
+  id                          String             @id @default(cuid())
+  userId                      String?
+  assetId                     String
+  tokenContractId             String?
+  walletId                    String?
+  intentId                    String?            @unique
+  depositAddressId            String?
+  sweepId                     String?
+  network                     Chain              @default(ARBITRUM)
+  channel                     DepositChannel     @default(UNMATCHED)
+  fromAddress                 String?
+  toAddress                   String
+  txHash                      String
+  logIndex                    Int?
+  blockNumber                 Int?
+  amount                      Decimal            @db.Decimal(38, 18)
+  rawAmount                   String?
+  confirmations               Int                @default(0)
+  status                      DepositStatus      @default(DETECTED)
+  idempotencyKey              String             @unique
+  creditedLedgerTransactionId String?            @unique
+  detectedAt                  DateTime           @default(now())
+  creditedAt                  DateTime?
+  createdAt                   DateTime           @default(now())
+  updatedAt                   DateTime           @updatedAt
+  user                        User?              @relation(fields: [userId], references: [id], onDelete: Restrict)
+  asset                       Asset              @relation(fields: [assetId], references: [id], onDelete: Restrict)
+  tokenContract               TokenContract?     @relation(fields: [tokenContractId], references: [id], onDelete: Restrict)
+  wallet                      Wallet?            @relation(fields: [walletId], references: [id], onDelete: SetNull)
+  intent                      DepositIntent?     @relation(fields: [intentId], references: [id], onDelete: SetNull)
+  depositAddress              UserDepositAddress? @relation(fields: [depositAddressId], references: [id], onDelete: SetNull)
+  sweep                       DepositSweep?      @relation(fields: [sweepId], references: [id], onDelete: SetNull)
+  creditedLedgerTransaction   LedgerTransaction? @relation("DepositCreditLedgerTransaction", fields: [creditedLedgerTransactionId], references: [id], onDelete: Restrict)
+
+  @@unique([network, txHash, logIndex])
+  @@index([userId, status])
+  @@index([assetId, status])
+  @@index([tokenContractId, status])
+  @@index([depositAddressId, status])
+  @@index([sweepId])
+  @@map("deposits")
+}
+
+model DepositIntent {
+  id              String              @id @default(cuid())
+  userId          String
+  assetId         String
+  tokenContractId String?
+  walletId        String
+  network         Chain
+  fromAddress     String
+  treasuryAddress String
+  amount          Decimal             @db.Decimal(38, 18)
+  rawAmount       String
+  txHash          String?             @unique
+  status          DepositIntentStatus @default(PENDING)
+  expiresAt       DateTime
+  submittedAt     DateTime?
+  detectedAt      DateTime?
+  confirmedAt     DateTime?
+  creditedAt      DateTime?
+  failureReason   String?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  user            User                @relation(fields: [userId], references: [id], onDelete: Restrict)
+  asset           Asset               @relation(fields: [assetId], references: [id], onDelete: Restrict)
+  tokenContract   TokenContract?      @relation(fields: [tokenContractId], references: [id], onDelete: Restrict)
+  wallet          Wallet              @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  deposit         Deposit?
+
+  @@index([userId, status])
+  @@index([tokenContractId, status])
+  @@index([status, expiresAt])
+  @@map("deposit_intents")
+}
+
+model UserDepositAddress {
+  id                String                   @id @default(cuid())
+  userId            String
+  network           Chain
+  address           String
+  provider          CustodyProvider          @default(PRIVY)
+  providerWalletRef String?                  @unique
+  externalId        String                   @unique
+  policyRef         String?
+  status            UserDepositAddressStatus @default(PROVISIONING)
+  failureReason     String?
+  provisionedAt     DateTime?
+  createdAt         DateTime                 @default(now())
+  updatedAt         DateTime                 @updatedAt
+  user              User                     @relation(fields: [userId], references: [id], onDelete: Restrict)
+  deposits          Deposit[]
+  sweeps            DepositSweep[]
+
+  @@unique([userId, network])
+  @@unique([network, address])
+  @@index([network, status])
+  @@map("user_deposit_addresses")
+}
+
+model DepositSweep {
+  id                          String             @id @default(cuid())
+  depositAddressId            String
+  assetId                     String
+  amount                      Decimal            @db.Decimal(38, 18)
+  rawAmount                   String
+  status                      DepositSweepStatus @default(PENDING)
+  gasFundingProviderRequestId String?            @unique
+  gasFundingTxHash            String?            @unique
+  providerRequestId           String?            @unique
+  txHash                      String?            @unique
+  attempts                    Int                @default(0)
+  failureReason               String?
+  startedAt                   DateTime?
+  broadcastedAt               DateTime?
+  confirmedAt                 DateTime?
+  createdAt                   DateTime           @default(now())
+  updatedAt                   DateTime           @updatedAt
+  depositAddress              UserDepositAddress @relation(fields: [depositAddressId], references: [id], onDelete: Restrict)
+  asset                       Asset              @relation(fields: [assetId], references: [id], onDelete: Restrict)
+  deposits                    Deposit[]
+
+  @@index([status, createdAt])
+  @@index([depositAddressId, assetId])
+  @@map("deposit_sweeps")
+}
+
+model Withdrawal {
+  id                           String             @id @default(cuid())
+  userId                       String
+  assetId                      String
+  tokenContractId              String?
+  network                      Chain              @default(ARBITRUM)
+  toAddress                    String
+  amount                       Decimal            @db.Decimal(38, 18)
+  feeAmount                    Decimal            @default(0) @db.Decimal(38, 18)
+  status                       WithdrawalStatus   @default(REQUESTED)
+  adminApprovalRequired        Boolean            @default(true)
+  requestedLedgerTransactionId String?            @unique
+  approvedByUserId             String?
+  rejectedByUserId             String?
+  approvalReason               String?
+  rejectionReason              String?
+  txHash                       String?
+  providerRequestId            String?            @unique
+  broadcastNonce               BigInt?
+  gasUsed                      BigInt?
+  effectiveGasPrice            BigInt?
+  broadcastAttempts            Int                @default(0)
+  lastBroadcastError           String?
+  destinationFirstSeenAt       DateTime?
+  requestedAt                  DateTime           @default(now())
+  approvedAt                   DateTime?
+  rejectedAt                   DateTime?
+  broadcastedAt                DateTime?
+  confirmedAt                  DateTime?
+  createdAt                    DateTime           @default(now())
+  updatedAt                    DateTime           @updatedAt
+  user                         User               @relation("WithdrawalOwner", fields: [userId], references: [id], onDelete: Restrict)
+  asset                        Asset              @relation(fields: [assetId], references: [id], onDelete: Restrict)
+  tokenContract                TokenContract?     @relation(fields: [tokenContractId], references: [id], onDelete: Restrict)
+  approvedBy                   User?              @relation("WithdrawalApprover", fields: [approvedByUserId], references: [id], onDelete: Restrict)
+  rejectedBy                   User?              @relation("WithdrawalRejector", fields: [rejectedByUserId], references: [id], onDelete: Restrict)
+  requestedLedgerTransaction   LedgerTransaction? @relation("WithdrawalReserveLedgerTransaction", fields: [requestedLedgerTransactionId], references: [id], onDelete: Restrict)
+
+  @@index([userId, status])
+  @@index([assetId, status])
+  @@index([tokenContractId, status])
+  @@map("withdrawals")
+}
+
+model DepositIndexerCursor {
+  id              String         @id @default(cuid())
+  key             String         @unique
+  networkId       String
+  tokenContractId String?
+  lastBlock       BigInt         @default(0)
+  updatedAt       DateTime       @updatedAt
+  network         Network        @relation(fields: [networkId], references: [id], onDelete: Cascade)
+  tokenContract   TokenContract? @relation(fields: [tokenContractId], references: [id], onDelete: Cascade)
+
+  @@index([networkId, tokenContractId])
+  @@map("deposit_indexer_cursors")
+}
+
+model WithdrawalAddress {
+  id          String    @id @default(cuid())
+  userId      String
+  network     Chain
+  address     String
+  firstSeenAt DateTime  @default(now())
+  lastUsedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, network, address])
+  @@index([userId, firstSeenAt])
+  @@map("withdrawal_addresses")
+}
+
+model ProviderWebhookEvent {
+  id                    String    @id
+  provider              String
+  eventType             String
+  referenceId           String?
+  providerTransactionId String?
+  payload               Json
+  processedAt           DateTime?
+  createdAt             DateTime  @default(now())
+
+  @@index([provider, referenceId])
+  @@index([eventType, createdAt])
+  @@map("provider_webhook_events")
+}
+
+model CustodyAccount {
+  id                String                   @id @default(cuid())
+  role              CustodyAccountRole
+  provider          CustodyProvider
+  network           Chain
+  address           String
+  providerWalletRef String?
+  policyRef         String?
+  status            CustodyAccountStatus     @default(ACTIVE)
+  metadata          Json?
+  createdAt         DateTime                 @default(now())
+  updatedAt         DateTime                 @updatedAt
+  snapshots         CustodyBalanceSnapshot[]
+  outgoingTransfers TreasuryTransfer[]       @relation("TreasuryTransferSource")
+  incomingTransfers TreasuryTransfer[]       @relation("TreasuryTransferDestination")
+
+  @@unique([network, address])
+  @@unique([role, network])
+  @@index([provider, status])
+  @@map("custody_accounts")
+}
+
+model CustodyBalanceSnapshot {
+  id               String         @id @default(cuid())
+  custodyAccountId String
+  assetId          String
+  balance          Decimal        @db.Decimal(38, 18)
+  blockNumber      BigInt?
+  source           String
+  capturedAt       DateTime       @default(now())
+  custodyAccount   CustodyAccount @relation(fields: [custodyAccountId], references: [id], onDelete: Cascade)
+  asset            Asset          @relation(fields: [assetId], references: [id], onDelete: Restrict)
+
+  @@index([custodyAccountId, assetId, capturedAt])
+  @@map("custody_balance_snapshots")
+}
+
+model TreasuryTransfer {
+  id                   String                 @id @default(cuid())
+  sourceAccountId      String
+  destinationAccountId String
+  assetId              String
+  amount               Decimal                @db.Decimal(38, 18)
+  status               TreasuryTransferStatus @default(PROPOSED)
+  reason               String
+  proposedByUserId     String?
+  approvedByUserId     String?
+  providerRequestId    String?                @unique
+  txHash               String?                @unique
+  failureReason        String?
+  approvedAt           DateTime?
+  broadcastedAt        DateTime?
+  confirmedAt          DateTime?
+  createdAt            DateTime               @default(now())
+  updatedAt            DateTime               @updatedAt
+  sourceAccount        CustodyAccount         @relation("TreasuryTransferSource", fields: [sourceAccountId], references: [id], onDelete: Restrict)
+  destinationAccount   CustodyAccount         @relation("TreasuryTransferDestination", fields: [destinationAccountId], references: [id], onDelete: Restrict)
+  asset                Asset                  @relation(fields: [assetId], references: [id], onDelete: Restrict)
+
+  @@index([status, createdAt])
+  @@map("treasury_transfers")
+}
+
+model Order {
+  id                        String             @id @default(cuid())
+  userId                    String
+  marketId                  String
+  clientOrderId             String
+  side                      OrderSide
+  type                      OrderType
+  status                    OrderStatus        @default(CREATED)
+  route                     ExecutionRoute?
+  size                      Decimal            @db.Decimal(38, 18)
+  filledSize                Decimal            @default(0) @db.Decimal(38, 18)
+  price                     Decimal?           @db.Decimal(38, 18)
+  averageFillPrice          Decimal?           @db.Decimal(38, 18)
+  triggerPrice              Decimal?           @db.Decimal(38, 18)
+  leverage                  Int
+  reduceOnly                Boolean            @default(false)
+  marginMode                MarginMode         @default(ISOLATED)
+  marginReserved            Decimal            @default(0) @db.Decimal(38, 18)
+  feeAmount                 Decimal            @default(0) @db.Decimal(38, 18)
+  rejectionReason           String?
+  marginLedgerTransactionId String?            @unique
+  liquidationEventId        String?            @unique
+  createdAt                 DateTime           @default(now())
+  updatedAt                 DateTime           @updatedAt
+  user                      User               @relation(fields: [userId], references: [id], onDelete: Restrict)
+  market                    Market             @relation(fields: [marketId], references: [id], onDelete: Restrict)
+  marginLedgerTransaction   LedgerTransaction? @relation("OrderMarginLedgerTransaction", fields: [marginLedgerTransactionId], references: [id], onDelete: Restrict)
+  liquidationEvent          LiquidationEvent?  @relation("LiquidationClosingOrder", fields: [liquidationEventId], references: [id], onDelete: Restrict)
+  providerOrder             ProviderOrder?
+  trades                    Trade[]
+
+  @@unique([userId, clientOrderId])
+  @@index([userId, status, createdAt])
+  @@index([marketId, status])
+  @@map("orders")
+}
+
+model Trade {
+  id             String         @id @default(cuid())
+  userId         String
+  orderId        String
+  marketId       String
+  providerFillId String?        @unique
+  route          ExecutionRoute
+  side           OrderSide
+  price          Decimal        @db.Decimal(38, 18)
+  size           Decimal        @db.Decimal(38, 18)
+  notional       Decimal        @db.Decimal(38, 18)
+  feeAmount      Decimal        @default(0) @db.Decimal(38, 18)
+  realizedPnl    Decimal        @default(0) @db.Decimal(38, 18)
+  executedAt     DateTime
+  createdAt      DateTime       @default(now())
+  user           User           @relation(fields: [userId], references: [id], onDelete: Restrict)
+  order          Order          @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  market         Market         @relation(fields: [marketId], references: [id], onDelete: Restrict)
+
+  @@index([userId, executedAt])
+  @@index([marketId, executedAt])
+  @@map("trades")
+}
+
+model Position {
+  id                  String             @id @default(cuid())
+  userId              String
+  marketId            String
+  side                PositionSide
+  status              PositionStatus     @default(OPEN)
+  route               ExecutionRoute
+  marginMode          MarginMode         @default(ISOLATED)
+  size                Decimal            @db.Decimal(38, 18)
+  entryPrice          Decimal            @db.Decimal(38, 18)
+  markPrice           Decimal            @db.Decimal(38, 18)
+  leverage            Int
+  margin              Decimal            @db.Decimal(38, 18)
+  maintenanceMargin   Decimal            @db.Decimal(38, 18)
+  liquidationPrice    Decimal            @db.Decimal(38, 18)
+  unrealizedPnl       Decimal            @default(0) @db.Decimal(38, 18)
+  realizedPnl         Decimal            @default(0) @db.Decimal(38, 18)
+  fundingPaid         Decimal            @default(0) @db.Decimal(38, 18)
+  providerPositionRef String?
+  openedAt            DateTime           @default(now())
+  closedAt            DateTime?
+  updatedAt           DateTime           @updatedAt
+  user                User               @relation(fields: [userId], references: [id], onDelete: Restrict)
+  market              Market             @relation(fields: [marketId], references: [id], onDelete: Restrict)
+  liquidations        LiquidationEvent[]
+
+  @@index([marketId, status])
+  @@index([userId, marketId, route, status])
+  @@map("positions")
+}
+
+model ProviderOrder {
+  id              String              @id @default(cuid())
+  orderId         String              @unique
+  marketId        String
+  provider        String
+  providerOrderId String?
+  cloid           String              @unique
+  status          ProviderOrderStatus @default(PENDING)
+  rawResponse     Json?
+  lastSyncedAt    DateTime?
+  nextSyncAt      DateTime?
+  syncAttempts    Int                 @default(0)
+  failureReason   String?
+  reconciliationRequiredAt DateTime?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  order           Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  market          Market              @relation(fields: [marketId], references: [id], onDelete: Restrict)
+  fills           ProviderFill[]
+
+  @@index([provider, status])
+  @@index([status, nextSyncAt])
+  @@map("provider_orders")
+}
+
+model ProviderFill {
+  id              String        @id @default(cuid())
+  providerOrderId String
+  providerFillId  String        @unique
+  price           Decimal       @db.Decimal(38, 18)
+  size            Decimal       @db.Decimal(38, 18)
+  feeAmount       Decimal       @default(0) @db.Decimal(38, 18)
+  occurredAt      DateTime
+  rawPayload      Json?
+  createdAt       DateTime      @default(now())
+  providerOrder   ProviderOrder @relation(fields: [providerOrderId], references: [id], onDelete: Cascade)
+
+  @@index([providerOrderId, occurredAt])
+  @@map("provider_fills")
+}
+
+model BBookExposure {
+  id                    String   @id @default(cuid())
+  marketId              String   @unique
+  longNotional          Decimal  @default(0) @db.Decimal(38, 18)
+  shortNotional         Decimal  @default(0) @db.Decimal(38, 18)
+  netNotional           Decimal  @default(0) @db.Decimal(38, 18)
+  unrealizedPlatformPnl Decimal  @default(0) @db.Decimal(38, 18)
+  updatedAt             DateTime @updatedAt
+  market                Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@map("bbook_exposures")
+}
+
+model RiskConfig {
+  id                        String   @id @default(cuid())
+  marketId                  String   @unique
+  bbookEnabled              Boolean  @default(false)
+  maxBbookOrderNotional     Decimal  @default(1000) @db.Decimal(38, 18)
+  maxMarketExposure         Decimal  @default(5000) @db.Decimal(38, 18)
+  maxTotalExposure          Decimal  @default(10000) @db.Decimal(38, 18)
+  maxPlatformUnrealizedLoss Decimal  @default(2000) @db.Decimal(38, 18)
+  maxLeverage               Int
+  maintenanceMarginRate     Decimal  @default(0.005) @db.Decimal(18, 8)
+  maxMarkAgeMs              Int      @default(2000)
+  maxOracleDeviationBps     Int      @default(100)
+  liquidationSlippageBps    Int      @default(50)
+  updatedAt                 DateTime @updatedAt
+  market                    Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@map("risk_configs")
+}
+
+model FeeConfig {
+  id                          String   @id @default(cuid())
+  marketId                    String   @unique
+  makerFeeBps                 Int      @default(2)
+  takerFeeBps                 Int      @default(5)
+  liquidationFeeBps           Int      @default(50)
+  liquidationPlatformShareBps Int      @default(7000)
+  updatedAt                   DateTime @updatedAt
+  market                      Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@map("fee_configs")
+}
+
+model LiquidationEvent {
+  id                  String             @id @default(cuid())
+  positionId          String
+  marketId            String
+  status              LiquidationStatus  @default(TRIGGERED)
+  markPrice           Decimal            @db.Decimal(38, 18)
+  positionSize        Decimal            @db.Decimal(38, 18)
+  collateralBefore    Decimal            @db.Decimal(38, 18)
+  realizedPnl         Decimal            @db.Decimal(38, 18)
+  liquidationFee      Decimal            @db.Decimal(38, 18)
+  platformFee         Decimal            @db.Decimal(38, 18)
+  insuranceFee        Decimal            @db.Decimal(38, 18)
+  ledgerTransactionId String?            @unique
+  failureReason       String?
+  triggeredAt         DateTime           @default(now())
+  completedAt         DateTime?
+  position            Position           @relation(fields: [positionId], references: [id], onDelete: Restrict)
+  market              Market             @relation(fields: [marketId], references: [id], onDelete: Restrict)
+  ledgerTransaction   LedgerTransaction? @relation("LiquidationLedgerTransaction", fields: [ledgerTransactionId], references: [id], onDelete: Restrict)
+  closingOrder        Order?              @relation("LiquidationClosingOrder")
+
+  @@index([status, triggeredAt])
+  @@map("liquidation_events")
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  actorUserId String?
+  action      String
+  entityType  String
+  entityId    String?
+  reason      String?
+  metadata    Json?
+  ipAddress   String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+  actor       User?    @relation("AuditActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([actorUserId, createdAt])
+  @@index([entityType, entityId])
+  @@map("audit_logs")
+}
+
+model ReconciliationRun {
+  id          String               @id @default(cuid())
+  type        ReconciliationType
+  status      ReconciliationStatus @default(RUNNING)
+  startedAt   DateTime             @default(now())
+  completedAt DateTime?
+  details     Json?
+
+  @@index([type, status])
+  @@map("reconciliation_runs")
+}
+
+model SystemSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("system_settings")
+}

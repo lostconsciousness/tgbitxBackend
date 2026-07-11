@@ -1,0 +1,3 @@
+ALTER TYPE "LedgerTransactionType" ADD VALUE 'SPOT_RESERVE';
+ALTER TYPE "LedgerTransactionType" ADD VALUE 'SPOT_RELEASE';
+ALTER TYPE "LedgerTransactionType" ADD VALUE 'SPOT_TRADE';

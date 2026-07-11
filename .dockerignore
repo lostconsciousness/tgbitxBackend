@@ -1,0 +1,9 @@
+node_modules
+apps/api/node_modules
+apps/api/dist
+.git
+.env
+.env.*
+*.log
+coverage
+tmp

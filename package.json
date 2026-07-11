@@ -1,0 +1,58 @@
+{
+  "name": "dream-crypto-exchange",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/api"
+  ],
+  "scripts": {
+    "build": "npm --workspace @dream-exchange/api run build",
+    "start:dev": "npm --workspace @dream-exchange/api run start:dev",
+    "start": "npm --workspace @dream-exchange/api run start",
+    "test": "npm --workspace @dream-exchange/api run test",
+    "test:integration": "npm --workspace @dream-exchange/api run test:integration",
+    "test:e2e:onchain": "npm --workspace @dream-exchange/api run test:e2e:onchain",
+    "privy:provision-wallets": "npm --workspace @dream-exchange/api run privy:provision-wallets",
+    "privy:generate-jwt-key": "npm --workspace @dream-exchange/api run privy:generate-jwt-key",
+    "privy:provision-solana": "npm --workspace @dream-exchange/api run privy:provision-solana",
+    "privy:provision-tron": "npm --workspace @dream-exchange/api run privy:provision-tron",
+    "privy:provision-hyperliquid": "npm --workspace @dream-exchange/api run privy:provision-hyperliquid",
+    "hyperliquid:spot-to-perp": "npm --workspace @dream-exchange/api run hyperliquid:spot-to-perp",
+    "hyperliquid:canary": "npm --workspace @dream-exchange/api run hyperliquid:canary",
+    "sol:fund-hot-from-deposit": "npm --workspace @dream-exchange/api run sol:fund-hot-from-deposit --",
+    "prisma:generate": "npm --workspace @dream-exchange/api run prisma:generate",
+    "migrate:dev": "npm --workspace @dream-exchange/api run migrate:dev",
+    "migrate:deploy": "npm --workspace @dream-exchange/api run migrate:deploy",
+    "seed": "npm --workspace @dream-exchange/api run seed"
+  },
+  "dependencies": {
+    "@nestjs/common": "11.1.27",
+    "@nestjs/core": "11.1.27",
+    "@nestjs/platform-express": "11.1.27",
+    "bitcoinjs-lib": "^7.0.1",
+    "dotenv": "^17.4.2",
+    "ecpair": "^3.0.1",
+    "multer": "2.2.0",
+    "tiny-secp256k1": "^2.2.4",
+    "tronweb": "^6.3.0"
+  },
+  "overrides": {
+    "@nestjs/common": "11.1.27",
+    "@nestjs/core": "11.1.27",
+    "@nestjs/platform-express": {
+      ".": "11.1.27",
+      "multer": "2.2.0"
+    },
+    "@nestjs/swagger@11.4.4": {
+      "js-yaml": "4.2.0"
+    },
+    "engine.io": "6.6.9",
+    "socket.io-adapter": "2.5.8",
+    "viem@2.52.2": {
+      "ws": "8.21.0"
+    }
+  },
+  "devDependencies": {
+    "prisma": "^5.22.0"
+  }
+}
