@@ -31,6 +31,12 @@ export class OrdersController {
     return this.orders.getExecutionReadiness();
   }
 
+  @Get('execution-readiness')
+  @ApiOperation({ summary: 'Get spot/perpetual execution readiness for the trading UI' })
+  executionReadiness() {
+    return this.orders.getExecutionReadiness();
+  }
+
   @Delete(':id')
   @ApiOperation({ summary: 'Cancel an open provider order' })
   cancel(@CurrentUser() user: AuthenticatedUser, @Param('id') id: string) {

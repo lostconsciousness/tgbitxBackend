@@ -19,6 +19,7 @@ import { AssetsService } from '../assets/assets.service';
 import { AuditService } from '../audit/audit.service';
 import { PrivyCustodyService } from '../treasury/privy-custody.service';
 import { NonEvmTestnetAdapterService } from '../onchain/non-evm-testnet-adapter.service';
+import { AlchemyWebhookAddressSyncService } from './alchemy-webhook-address-sync.service';
 
 @Injectable()
 export class DepositAddressService {
@@ -31,6 +32,7 @@ export class DepositAddressService {
     private readonly audit: AuditService,
     private readonly config: ConfigService,
     private readonly nonEvm: NonEvmTestnetAdapterService,
+    private readonly alchemyAddresses: AlchemyWebhookAddressSyncService,
   ) {}
 
   async provision(userId: string, assetSymbol: string, networkKey?: string) {
@@ -41,6 +43,7 @@ export class DepositAddressService {
       where: { userId_network: { userId, network } },
     });
     if (existing?.status === UserDepositAddressStatus.ACTIVE) {
+      await this.trackAlchemyAddress(target.network.chainKey, existing.address);
       return this.toResponse(existing, target);
     }
     if (existing?.status === UserDepositAddressStatus.PAUSED) {
@@ -198,6 +201,7 @@ export class DepositAddressService {
         entityId: active.id,
         metadata: { network, address, provider: 'PRIVY' },
       });
+      await this.trackAlchemyAddress(target.network.chainKey, active.address);
       return this.toResponse(active, target);
     } catch (error) {
       const reason = this.safeErrorMessage(error);
@@ -408,5 +412,15 @@ export class DepositAddressService {
       return error.message.replace(/wallet-auth:[A-Za-z0-9+/=:_-]+/g, 'wallet-auth:<redacted>');
     }
     return 'Unknown error';
+  }
+
+  private async trackAlchemyAddress(networkKey: string, address: string): Promise<void> {
+    try {
+      await this.alchemyAddresses.trackAddress(networkKey, address);
+    } catch (error) {
+      this.logger.warn(
+        `Alchemy webhook address update failed for ${networkKey}: ${this.safeErrorMessage(error)}`,
+      );
+    }
   }
 }

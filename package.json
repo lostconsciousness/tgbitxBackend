@@ -16,9 +16,17 @@
     "privy:generate-jwt-key": "npm --workspace @dream-exchange/api run privy:generate-jwt-key",
     "privy:provision-solana": "npm --workspace @dream-exchange/api run privy:provision-solana",
     "privy:provision-tron": "npm --workspace @dream-exchange/api run privy:provision-tron",
+    "privy:update-deposit-sweep-policy": "npm --workspace @dream-exchange/api run privy:update-deposit-sweep-policy",
+    "privy:update-spot-liquidity-policy": "npm --workspace @dream-exchange/api run privy:update-spot-liquidity-policy",
     "privy:provision-hyperliquid": "npm --workspace @dream-exchange/api run privy:provision-hyperliquid",
     "hyperliquid:spot-to-perp": "npm --workspace @dream-exchange/api run hyperliquid:spot-to-perp",
+    "hyperliquid:fund-master-gas": "npm --workspace @dream-exchange/api run hyperliquid:fund-master-gas --",
+    "hyperliquid:update-bridge-policy": "npm --workspace @dream-exchange/api run hyperliquid:update-bridge-policy",
+    "hyperliquid:bridge-deposit": "npm --workspace @dream-exchange/api run hyperliquid:bridge-deposit --",
     "hyperliquid:canary": "npm --workspace @dream-exchange/api run hyperliquid:canary",
+    "hyperliquid:sync-tradingview-symbols": "npm --workspace @dream-exchange/api run sync:hyperliquid-tradingview-symbols",
+    "spot:onboard-assets": "npm --workspace @dream-exchange/api run spot:onboard-assets --",
+    "tron:recover-deposits": "npm --workspace @dream-exchange/api run tron:recover-deposits --",
     "sol:fund-hot-from-deposit": "npm --workspace @dream-exchange/api run sol:fund-hot-from-deposit --",
     "prisma:generate": "npm --workspace @dream-exchange/api run prisma:generate",
     "migrate:dev": "npm --workspace @dream-exchange/api run migrate:dev",
@@ -29,6 +37,8 @@
     "@nestjs/common": "11.1.27",
     "@nestjs/core": "11.1.27",
     "@nestjs/platform-express": "11.1.27",
+    "@nestjs/platform-socket.io": "11.1.27",
+    "@nestjs/websockets": "11.1.27",
     "bitcoinjs-lib": "^7.0.1",
     "dotenv": "^17.4.2",
     "ecpair": "^3.0.1",
@@ -54,5 +64,12 @@
   },
   "devDependencies": {
     "prisma": "^5.22.0"
+  },
+  "allowScripts": {
+    "@prisma/client@5.22.0": true,
+    "@prisma/engines@5.22.0": true,
+    "bigint-buffer@1.1.5": true,
+    "fsevents@2.3.3": true,
+    "prisma@5.22.0": true
   }
 }

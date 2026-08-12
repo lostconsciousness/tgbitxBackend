@@ -104,6 +104,7 @@ describe('OrdersService execution readiness', () => {
     const prisma = {
       order: { findUnique: jest.fn().mockResolvedValue(null) },
       position: { findFirst: jest.fn().mockResolvedValue(null) },
+      bBookExposure: { findMany: jest.fn().mockResolvedValue([]) },
       riskConfig: {
         upsert: jest.fn().mockResolvedValue({
           maxLeverage: 10,
@@ -143,6 +144,9 @@ describe('OrdersService execution readiness', () => {
         time: Date.now(),
         bids: [{ price: '59900' }],
         asks: [{ price: '60100' }],
+      }), getTicker: jest.fn().mockResolvedValue({
+        markPrice: '60000',
+        notional24h: '5000000',
       }) } as unknown as MarketDataService,
       { decide: jest.fn().mockResolvedValue(ExecutionRoute.A_BOOK_HYPERLIQUID) } as unknown as RoutingService,
       {} as LedgerService,
@@ -206,7 +210,73 @@ describe('OrdersService provider recovery', () => {
     quoteAssetId: 'asset-usdc',
   };
 
-  it('escalates an old unknown cloid without releasing margin', async () => {
+  it('terminalizes a provider margin rejection instead of retrying it forever', async () => {
+    const order = {
+      id: 'order-margin-rejected',
+      userId: 'user-1',
+      marketId: market.id,
+      status: OrderStatus.PROVIDER_PENDING,
+      size: new Prisma.Decimal('0.00024'),
+      filledSize: new Prisma.Decimal(0),
+      marginReserved: new Prisma.Decimal(0),
+      market,
+      liquidationEvent: null,
+    };
+    const providerOrder = {
+      id: 'provider-margin-rejected',
+      orderId: order.id,
+      providerOrderId: null,
+      cloid: `0x${'b'.repeat(32)}`,
+      status: ProviderOrderStatus.PENDING,
+      syncAttempts: 1,
+      createdAt: new Date(),
+      failureReason: 'order 0: Insufficient margin to place order. asset=0',
+      order,
+    };
+    const tx = {
+      providerOrder: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+      order: { update: jest.fn().mockResolvedValue({}) },
+    };
+    const prisma = {
+      providerOrder: { findUnique: jest.fn().mockResolvedValue(providerOrder) },
+      order: { findUniqueOrThrow: jest.fn().mockResolvedValue({ ...order, status: OrderStatus.FAILED }) },
+      $transaction: jest.fn(async (callback: (client: typeof tx) => unknown) => callback(tx)),
+    };
+    const hyperliquid = {
+      getOrderSnapshot: jest.fn(),
+      getOrderFills: jest.fn(),
+    };
+    const updates = { publish: jest.fn() };
+    const service = new OrdersService(
+      prisma as unknown as PrismaService,
+      { get: jest.fn((_key: string, fallback: unknown) => fallback) } as unknown as ConfigService,
+      {} as MarketsService,
+      {} as MarketDataService,
+      {} as RoutingService,
+      { postTransaction: jest.fn() } as unknown as LedgerService,
+      hyperliquid as unknown as HyperliquidExecutionService,
+      {} as OperationalSettingsService,
+      updates as never,
+    );
+
+    await service.reconcileProviderOrder(order.id);
+
+    expect(tx.providerOrder.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: ProviderOrderStatus.FAILED, nextSyncAt: null }),
+    }));
+    expect(tx.order.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: OrderStatus.FAILED }),
+    }));
+    expect(hyperliquid.getOrderSnapshot).not.toHaveBeenCalled();
+    expect(updates.publish).toHaveBeenCalledWith('user-1', [
+      'balances',
+      'orders',
+      'positions',
+      'trades',
+    ]);
+  });
+
+  it('escalates an old unknown cloid without releasing margin and schedules a slow recheck', async () => {
     const order = {
       id: 'order-unknown',
       userId: 'user-1',
@@ -245,6 +315,7 @@ describe('OrdersService provider recovery', () => {
       get: jest.fn((key: string, fallback?: unknown) => ({
         PROVIDER_RECONCILIATION_MAX_ATTEMPTS: 20,
         PROVIDER_RECONCILIATION_UNKNOWN_GRACE_MS: 300_000,
+        PROVIDER_RECONCILIATION_MANUAL_RECHECK_MS: 300_000,
       } as Record<string, unknown>)[key] ?? fallback),
     };
     const service = new OrdersService(
@@ -264,7 +335,7 @@ describe('OrdersService provider recovery', () => {
       where: { id: providerOrder.id },
       data: expect.objectContaining({
         status: ProviderOrderStatus.RECONCILIATION_REQUIRED,
-        nextSyncAt: null,
+        nextSyncAt: expect.any(Date),
       }),
     });
     expect(prisma.$transaction).not.toHaveBeenCalled();
@@ -317,6 +388,166 @@ describe('OrdersService provider recovery', () => {
     expect(service.reconcileProviderOrder).toHaveBeenCalledWith(order.id);
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
+
+  it('terminalizes a partial IOC fill, releases unused margin and publishes after commit', async () => {
+    const order = {
+      id: 'order-partial-ioc',
+      userId: 'user-1',
+      marketId: market.id,
+      status: OrderStatus.PARTIALLY_FILLED,
+      size: new Prisma.Decimal('0.01'),
+      filledSize: new Prisma.Decimal('0.006'),
+      marginReserved: new Prisma.Decimal('100'),
+      market,
+      liquidationEvent: null,
+    };
+    const providerOrder = {
+      id: 'provider-partial-ioc',
+      orderId: order.id,
+      cloid: `0x${'c'.repeat(32)}`,
+      status: ProviderOrderStatus.PENDING,
+      syncAttempts: 2,
+      createdAt: new Date(),
+      order,
+    };
+    const tx = {
+      providerOrder: { update: jest.fn() },
+      order: { update: jest.fn() },
+    };
+    const prisma = {
+      providerOrder: { findUnique: jest.fn().mockResolvedValue(providerOrder) },
+      order: { findUniqueOrThrow: jest.fn().mockResolvedValue(order) },
+      $transaction: jest.fn(async (callback: (client: typeof tx) => unknown) => callback(tx)),
+    };
+    const ledger = { postTransaction: jest.fn().mockResolvedValue({ id: 'release-1' }) };
+    const updates = { publish: jest.fn() };
+    const hyperliquid = {
+      getOrderSnapshot: jest.fn().mockResolvedValue({
+        status: 'FILLED',
+        providerOrderId: 'provider-oid',
+        raw: {},
+      }),
+      getOrderFills: jest.fn().mockResolvedValue([]),
+    };
+    const service = new OrdersService(
+      prisma as unknown as PrismaService,
+      { get: jest.fn((_key: string, fallback?: unknown) => fallback) } as unknown as ConfigService,
+      {} as MarketsService,
+      {} as MarketDataService,
+      {} as RoutingService,
+      ledger as unknown as LedgerService,
+      hyperliquid as unknown as HyperliquidExecutionService,
+      {} as OperationalSettingsService,
+      updates as never,
+    );
+
+    await service.reconcileProviderOrder(order.id);
+
+    expect(ledger.postTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        idempotencyKey: `provider-order-release:${order.id}`,
+        entries: expect.arrayContaining([
+          expect.objectContaining({ amount: new Prisma.Decimal('40') }),
+        ]),
+      }),
+      tx,
+    );
+    expect(tx.order.update).toHaveBeenCalledWith({
+      where: { id: order.id },
+      data: expect.objectContaining({ status: OrderStatus.CANCELLED }),
+    });
+    expect(tx.providerOrder.update).toHaveBeenCalledWith({
+      where: { id: providerOrder.id },
+      data: expect.objectContaining({
+        status: ProviderOrderStatus.FILLED,
+        nextSyncAt: null,
+      }),
+    });
+    expect(updates.publish).toHaveBeenCalledWith('user-1', [
+      'balances',
+      'orders',
+      'positions',
+      'trades',
+    ]);
+  });
+});
+
+describe('OrdersService omnibus close netting', () => {
+  it('fills a reduce-only close internally when it reduces the provider/internal mismatch', async () => {
+    const order = {
+      id: 'close-order-1',
+      userId: 'user-long',
+      marketId: 'market-btc-perp',
+      side: OrderSide.SELL,
+      size: new Prisma.Decimal('0.00024'),
+      filledSize: new Prisma.Decimal(0),
+      feeAmount: new Prisma.Decimal('0.0075'),
+      leverage: 10,
+      reduceOnly: true,
+      market: { providerSymbol: 'BTC', quoteAssetId: 'asset-usdc' },
+    };
+    const tx = {
+      $executeRawUnsafe: jest.fn().mockResolvedValue(1),
+      order: { findUniqueOrThrow: jest.fn().mockResolvedValue(order) },
+      position: {
+        findMany: jest.fn().mockResolvedValue([
+          { side: PositionSide.LONG, size: new Prisma.Decimal('0.00024') },
+          { side: PositionSide.SHORT, size: new Prisma.Decimal('0.00159') },
+        ]),
+      },
+      riskConfig: {
+        findUniqueOrThrow: jest.fn().mockResolvedValue({
+          maintenanceMarginRate: new Prisma.Decimal('0.005'),
+        }),
+      },
+      systemSetting: {
+        upsert: jest.fn().mockResolvedValue({}),
+      },
+    };
+    const prisma = {
+      $transaction: jest.fn((callback: (client: typeof tx) => Promise<unknown>) => callback(tx)),
+    };
+    const hyperliquid = {
+      getAccountState: jest.fn().mockResolvedValue({
+        assetPositions: [{ position: { coin: 'BTC', szi: '-0.00156' } }],
+      }),
+    };
+    const service = new OrdersService(
+      prisma as unknown as PrismaService,
+      {} as ConfigService,
+      {} as MarketsService,
+      {} as MarketDataService,
+      {} as RoutingService,
+      {} as LedgerService,
+      hyperliquid as unknown as HyperliquidExecutionService,
+      {} as OperationalSettingsService,
+    );
+    const applyFill = jest.spyOn(service as never, 'applyFill' as never)
+      .mockResolvedValue(undefined as never);
+
+    const result = await (service as unknown as {
+      applyExistingProviderHedgeCoverage: (
+        value: typeof order,
+        price: Prisma.Decimal,
+      ) => Promise<{ remaining: Prisma.Decimal; providerPosition: Prisma.Decimal }>;
+    }).applyExistingProviderHedgeCoverage(order, new Prisma.Decimal('63111.5'));
+
+    expect(result.remaining.isZero()).toBe(true);
+    expect(result.providerPosition.equals('-0.00156')).toBe(true);
+    expect(applyFill).toHaveBeenCalledWith(tx, expect.objectContaining({
+      size: expect.objectContaining({ s: 1 }),
+      reduceOnly: true,
+      providerFillId: `internal-net:${order.id}`,
+    }));
+    expect(tx.systemSetting.upsert).toHaveBeenCalledWith({
+      where: { key: 'abook:provider-position-offset:BTC' },
+      create: {
+        key: 'abook:provider-position-offset:BTC',
+        value: '0.00003',
+      },
+      update: { value: '0.00003' },
+    });
+  });
 });
 
 describe('OrdersService spot orders', () => {
@@ -340,7 +571,7 @@ describe('OrdersService spot orders', () => {
     quoteAsset: {},
   };
 
-  function createSpotHarness() {
+  function createSpotHarness(marketDataProvider = 'MOCK') {
     const tx = {
       order: {
         create: jest.fn().mockImplementation(({ data }: { data: Record<string, unknown> }) => ({
@@ -397,22 +628,28 @@ describe('OrdersService spot orders', () => {
       assertSufficientUserSpotBalance: jest.fn(),
       postTransaction: jest.fn().mockResolvedValue({ id: 'ledger-1' }),
     };
+    const updates = { publish: jest.fn() };
     const service = new OrdersService(
       prisma as unknown as PrismaService,
-      { get: jest.fn((_key: string, fallback: unknown) => fallback) } as unknown as ConfigService,
+      {
+        get: jest.fn((key: string, fallback: unknown) =>
+          key === 'MARKET_DATA_PROVIDER' ? marketDataProvider : fallback,
+        ),
+      } as unknown as ConfigService,
       markets as unknown as MarketsService,
       marketData as unknown as MarketDataService,
       {} as RoutingService,
       ledger as unknown as LedgerService,
       {} as HyperliquidExecutionService,
       { getBoolean: jest.fn().mockResolvedValue(false) } as unknown as OperationalSettingsService,
+      updates as never,
     );
 
-    return { service, prisma, tx, markets, marketData, ledger };
+    return { service, prisma, tx, markets, marketData, ledger, updates };
   }
 
   it('fills a spot market buy through balanced ledger entries', async () => {
-    const { service, tx, ledger } = createSpotHarness();
+    const { service, tx, ledger, updates } = createSpotHarness();
 
     await service.createOrder('user-1', {
       symbol: 'BTC-USDC',
@@ -435,6 +672,12 @@ describe('OrdersService spot orders', () => {
     const feePosting = ledger.postTransaction.mock.calls[1][0];
     assertBalancedLedgerEntries(exchangePosting.entries);
     assertBalancedLedgerEntries(feePosting.entries);
+    expect(updates.publish).toHaveBeenCalledWith('user-1', [
+      'balances',
+      'orders',
+      'positions',
+      'trades',
+    ]);
     expect(exchangePosting.entries).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -467,6 +710,23 @@ describe('OrdersService spot orders', () => {
         averageFillPrice: expect.objectContaining({ s: 1 }),
       }),
     });
+  });
+
+  it('does not execute a production spot order against a mock order book', async () => {
+    const { service, prisma, ledger } = createSpotHarness('HYPERLIQUID');
+
+    await expect(service.createOrder('user-1', {
+      symbol: 'BTC-USDC',
+      clientOrderId: 'client-production-mock-rejected',
+      side: OrderSide.BUY,
+      type: OrderType.MARKET,
+      size: '0.01',
+    })).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'SPOT_EXECUTION_UNAVAILABLE' }),
+    });
+
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(ledger.assertSufficientUserSpotBalance).not.toHaveBeenCalled();
   });
 
   it('fills a spot market sell through balanced ledger entries', async () => {
@@ -565,7 +825,7 @@ describe('OrdersService spot orders', () => {
       entries: expect.any(Array),
     }, tx);
     assertBalancedLedgerEntries(ledger.postTransaction.mock.calls[0][0].entries);
-    expect(marketData.getOrderBook).not.toHaveBeenCalled();
+    expect(marketData.getOrderBook).toHaveBeenCalledWith('BTC-USDC');
   });
 
   it('releases a spot limit reserve on cancel', async () => {

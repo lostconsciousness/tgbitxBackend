@@ -31,13 +31,16 @@ export class PositionsService {
     private readonly marketData: MarketDataService,
   ) {}
 
-  async listUserPositions(userId: string) {
+  async listUserPositions(
+    userId: string,
+    options?: { includeLiveMarks?: boolean },
+  ) {
     const positions = await this.prisma.position.findMany({
       where: { userId },
       include: positionMarketInclude,
       orderBy: { openedAt: 'desc' },
     });
-    const openSymbols = [
+    const openSymbols = options?.includeLiveMarks === false ? [] : [
       ...new Set(
         positions
           .filter((position) => position.status === PositionStatus.OPEN)

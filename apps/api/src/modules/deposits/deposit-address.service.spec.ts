@@ -70,6 +70,7 @@ describe('DepositAddressService', () => {
       {} as AuditService,
       config,
       {} as never,
+      { trackAddress: jest.fn() } as never,
     );
 
     const result = await service.provision('user-1', 'USDC');
@@ -110,6 +111,7 @@ describe('DepositAddressService', () => {
       { record: jest.fn() } as unknown as AuditService,
       config,
       {} as never,
+      { trackAddress: jest.fn() } as never,
     );
 
     const result = await service.provision('user-1', 'USDC');
@@ -163,6 +165,7 @@ describe('DepositAddressService', () => {
       { record: jest.fn() } as unknown as AuditService,
       config,
       {} as never,
+      { trackAddress: jest.fn() } as never,
     );
 
     const result = await service.provision('user-1', 'USDC');

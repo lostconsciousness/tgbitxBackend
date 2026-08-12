@@ -10,6 +10,8 @@ describe('PositionsService', () => {
           market: {
             symbol: 'BTC-PERP',
             type: MarketType.PERP,
+            pricePrecision: 1,
+            sizePrecision: 5,
             baseAsset: { symbol: 'BTC' },
             quoteAsset: { symbol: 'USDC' },
           },
@@ -57,7 +59,20 @@ describe('PositionsService', () => {
         notionalUsdc: '2.9547',
         unrealizedPnl: '0.0147',
         pnlCurrency: 'USDC',
+        displayPricePrecision: 0,
+        exitPrice: null,
       }),
     ]);
+
+    marketData.getOrderBook.mockClear();
+    await expect(
+      service.listUserPositions('user-1', { includeLiveMarks: false }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        markPrice: '60100',
+        unrealizedPnl: '0.0049',
+      }),
+    ]);
+    expect(marketData.getOrderBook).not.toHaveBeenCalled();
   });
 });

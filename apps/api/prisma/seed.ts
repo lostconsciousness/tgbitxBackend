@@ -739,6 +739,96 @@ async function seedTokenContracts(): Promise<void> {
       minWithdrawalAmount: '10',
     },
     {
+      symbol: 'LINK',
+      network: 'arbitrum',
+      address: '0xf97f4df75117a78c1A5a0DBb814Af92458539FB4',
+      decimals: 18,
+      withdrawalFeeAmount: '0',
+      minWithdrawalAmount: '0',
+      spotOnly: true,
+    },
+    {
+      symbol: 'UNI',
+      network: 'arbitrum',
+      address: '0xFa7F8980b0f1E64A2062791CC3b0871572F1F7f0',
+      decimals: 18,
+      withdrawalFeeAmount: '0',
+      minWithdrawalAmount: '0',
+      spotOnly: true,
+    },
+    {
+      symbol: 'AAVE',
+      network: 'arbitrum',
+      address: '0xba5DdD1f9d7F570dc94a51479a000E3BCE967196',
+      decimals: 18,
+      withdrawalFeeAmount: '0',
+      minWithdrawalAmount: '0',
+      spotOnly: true,
+    },
+    {
+      symbol: 'PENDLE',
+      network: 'arbitrum',
+      address: '0x0c880f6761F1af8d9Aa9C466984b80DAb9a8c9e8',
+      decimals: 18,
+      withdrawalFeeAmount: '0',
+      minWithdrawalAmount: '0',
+      spotOnly: true,
+    },
+    {
+      symbol: 'GMX',
+      network: 'arbitrum',
+      address: '0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a',
+      decimals: 18,
+      withdrawalFeeAmount: '0',
+      minWithdrawalAmount: '0',
+      spotOnly: true,
+    },
+    {
+      symbol: 'DAI',
+      network: 'arbitrum',
+      address: '0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1',
+      decimals: 18,
+      withdrawalFeeAmount: '0',
+      minWithdrawalAmount: '0',
+      spotOnly: true,
+    },
+    {
+      symbol: 'CRV',
+      network: 'arbitrum',
+      address: '0x11cDb42B0EB46D95f990BeDD4695A6e3fA034978',
+      decimals: 18,
+      withdrawalFeeAmount: '0',
+      minWithdrawalAmount: '0',
+      spotOnly: true,
+    },
+    {
+      symbol: 'LDO',
+      network: 'arbitrum',
+      address: '0x13Ad51ed4f1B7e9dc168d8A00cb3F4dDD85Efa60',
+      decimals: 18,
+      withdrawalFeeAmount: '0',
+      minWithdrawalAmount: '0',
+      spotOnly: true,
+    },
+    {
+      symbol: 'GRT',
+      network: 'arbitrum',
+      address: '0x9623063377ad1B27544c965ccd7342f7EA7e88C7',
+      decimals: 18,
+      withdrawalFeeAmount: '0',
+      minWithdrawalAmount: '0',
+      spotOnly: true,
+    },
+    {
+      symbol: 'SUSHI',
+      network: 'arbitrum',
+      address: '0xd4d42F0b6DEF4ce0383636770ef773390d85c61A',
+      decimals: 18,
+      withdrawalFeeAmount: '0',
+      minWithdrawalAmount: '0',
+      spotOnly: true,
+    },
+    {
       symbol: 'USDC',
       network: 'base',
       address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
@@ -881,6 +971,7 @@ async function seedTokenContracts(): Promise<void> {
     const network = networkByKey.get(contract.network);
     if (!asset || !network) continue;
     const address = contract.address?.trim() ? contract.address : null;
+    const transfersEnabled = !('spotOnly' in contract && contract.spotOnly);
     const verification = await verifyErc20ContractForSeed(network, address);
     await prisma.tokenContract.upsert({
       where: {
@@ -893,8 +984,8 @@ async function seedTokenContracts(): Promise<void> {
       update: {
         address,
         decimals: contract.decimals,
-        depositEnabled: Boolean(address) && isAutoEnabledNetwork(contract.network),
-        withdrawalEnabled: Boolean(address) && isAutoEnabledNetwork(contract.network),
+        depositEnabled: transfersEnabled && Boolean(address) && isAutoEnabledNetwork(contract.network),
+        withdrawalEnabled: transfersEnabled && Boolean(address) && isAutoEnabledNetwork(contract.network),
         withdrawalFeeAmount: contract.withdrawalFeeAmount,
         minWithdrawalAmount: contract.minWithdrawalAmount,
         contractVerifiedAt: verification?.verifiedAt,
@@ -907,8 +998,8 @@ async function seedTokenContracts(): Promise<void> {
         standard: TokenStandard.ERC20,
         address,
         decimals: contract.decimals,
-        depositEnabled: Boolean(address) && isAutoEnabledNetwork(contract.network),
-        withdrawalEnabled: Boolean(address) && isAutoEnabledNetwork(contract.network),
+        depositEnabled: transfersEnabled && Boolean(address) && isAutoEnabledNetwork(contract.network),
+        withdrawalEnabled: transfersEnabled && Boolean(address) && isAutoEnabledNetwork(contract.network),
         withdrawalFeeAmount: contract.withdrawalFeeAmount,
         minWithdrawalAmount: contract.minWithdrawalAmount,
         contractVerifiedAt: verification?.verifiedAt,
@@ -1501,6 +1592,13 @@ async function seedCustodyAccounts(): Promise<void> {
       policyRef: process.env.PRIVY_SWEEP_GAS_POLICY_ID,
     },
     {
+      role: CustodyAccountRole.SPOT_LIQUIDITY,
+      provider: CustodyProvider.PRIVY,
+      address: process.env.SPOT_LIQUIDITY_ADDRESS,
+      providerWalletRef: process.env.PRIVY_SPOT_LIQUIDITY_WALLET_ID,
+      policyRef: process.env.PRIVY_SPOT_LIQUIDITY_POLICY_ID,
+    },
+    {
       role: CustodyAccountRole.SAFE_RESERVE,
       provider: CustodyProvider.SAFE,
       address: process.env.SAFE_RESERVE_ADDRESS,
@@ -1513,13 +1611,17 @@ async function seedCustodyAccounts(): Promise<void> {
     },
     {
       role: CustodyAccountRole.PLATFORM_CAPITAL,
-      provider: CustodyProvider.SAFE,
+      provider: CustodyProvider.PRIVY,
       address: process.env.PLATFORM_CAPITAL_ADDRESS,
+      providerWalletRef: process.env.PRIVY_PLATFORM_CAPITAL_WALLET_ID,
+      policyRef: process.env.PRIVY_PLATFORM_CAPITAL_POLICY_ID,
     },
     {
       role: CustodyAccountRole.INSURANCE,
-      provider: CustodyProvider.SAFE,
+      provider: CustodyProvider.PRIVY,
       address: process.env.INSURANCE_ADDRESS,
+      providerWalletRef: process.env.PRIVY_INSURANCE_WALLET_ID,
+      policyRef: process.env.PRIVY_INSURANCE_POLICY_ID,
     },
   ];
 
@@ -1624,25 +1726,25 @@ async function seedMarkets(): Promise<void> {
   await upsertMarket('BTC-PERP', 'BTC', 'USDC', MarketType.PERP, 1, 5, '0.00001', {
     providerName: 'HYPERLIQUID',
     providerSymbol: 'BTC',
-    tradingViewSymbol: 'HYPERLIQUID:BTCUSDC',
+    tradingViewSymbol: 'HYPERLIQUID:BTCUSDC.P',
     orderbookEnabled: true,
   });
   await upsertMarket('ETH-PERP', 'ETH', 'USDC', MarketType.PERP, 2, 4, '0.0001', {
     providerName: 'HYPERLIQUID',
     providerSymbol: 'ETH',
-    tradingViewSymbol: 'HYPERLIQUID:ETHUSDC',
+    tradingViewSymbol: 'HYPERLIQUID:ETHUSDC.P',
     orderbookEnabled: true,
   });
   await upsertMarket('SOL-PERP', 'SOL', 'USDC', MarketType.PERP, 3, 2, '0.01', {
     providerName: 'HYPERLIQUID',
     providerSymbol: 'SOL',
-    tradingViewSymbol: 'HYPERLIQUID:SOLUSDC',
+    tradingViewSymbol: 'HYPERLIQUID:SOLUSDC.P',
     orderbookEnabled: true,
   });
   await upsertMarket('TRX-PERP', 'TRX', 'USDC', MarketType.PERP, 5, 2, '1', {
     providerName: 'HYPERLIQUID',
     providerSymbol: 'TRX',
-    tradingViewSymbol: 'HYPERLIQUID:TRXUSDC',
+    tradingViewSymbol: 'HYPERLIQUID:TRXUSDC.P',
     orderbookEnabled: true,
   });
   const { syncHyperliquidPerpMarkets } = await import('../src/modules/markets/hyperliquid-perp-market.sync');

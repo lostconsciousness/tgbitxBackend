@@ -43,6 +43,11 @@ export class HealthController {
       },
       operations: {
         tradingPaused: await this.settings.getBoolean('trading:paused', 'TRADING_PAUSED', false),
+        aBookReconciliationPaused: await this.settings.getBoolean(
+          'abook:reconciliation-paused',
+          'ABOOK_RECONCILIATION_PAUSED',
+          false,
+        ),
         withdrawalsPaused: await this.settings.getBoolean(
           'withdrawals:paused',
           'WITHDRAWALS_PAUSED',

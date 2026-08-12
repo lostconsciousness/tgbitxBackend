@@ -122,7 +122,10 @@ export class MarketDataService {
       (sum, trade) => sum.plus(trade.notional),
       new Prisma.Decimal(0),
     );
-    const lastPrice = last?.price ?? mid;
+    // The public ticker must track the same live Hyperliquid book as the
+    // order book. An internal user trade can be hours old and is not a valid
+    // current market price.
+    const lastPrice = mid;
     const priceChange24h =
       first && lastPrice
         ? new Prisma.Decimal(lastPrice).minus(first.price)

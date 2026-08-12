@@ -1,7 +1,16 @@
 import { BadRequestException, Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { Chain, CustodyAccountRole, Network, NetworkFamily, TokenStandard } from '@prisma/client';
+import {
+  Asset,
+  Chain,
+  CustodyAccountRole,
+  Network,
+  NetworkFamily,
+  Prisma,
+  TokenContract,
+  TokenStandard,
+} from '@prisma/client';
 import { createHash } from 'crypto';
 import { Address, Hex, decodeEventLog, formatUnits, getAddress, parseAbiItem, parseUnits } from 'viem';
 import { AssetsService } from '../assets/assets.service';
@@ -21,6 +30,22 @@ type TransferArgs = {
   to: Address;
   value: bigint;
 };
+type IndexedTokenContract = Prisma.TokenContractGetPayload<{
+  include: { asset: true; network: true };
+}>;
+type Erc20ScanPlan = {
+  contract: IndexedTokenContract;
+  fromBlock: number;
+  toBlock: number;
+  latestBlock: number;
+  advancesCursor: boolean;
+};
+type Erc20Target = {
+  asset: Asset;
+  tokenContract: TokenContract;
+  network: Network;
+  legacyChain: Chain;
+};
 
 @Injectable()
 export class DepositIndexerService {
@@ -30,6 +55,11 @@ export class DepositIndexerService {
   private balanceReconcileRunning = false;
   private userSyncInFlight = new Map<string, Promise<void>>();
   private readonly lastUserSyncAt = new Map<string, number>();
+  private lastEvmFallbackScanAt = 0;
+  private readonly latestBlockCache = new Map<
+    string,
+    { expiresAt: number; value: Promise<number> }
+  >();
 
   constructor(
     private readonly assetsService: AssetsService,
@@ -139,10 +169,28 @@ export class DepositIndexerService {
         where: this.depositEnabledContractFilter(),
         include: { asset: true, network: true },
       });
+      const scanEvmThisRun = this.shouldRunEvmFallbackScan();
+      const evmErc20Contracts = contracts.filter(
+        (contract) =>
+          contract.network.family === NetworkFamily.EVM &&
+          contract.standard === TokenStandard.ERC20,
+      );
+      const directContracts = contracts.filter(
+        (contract) =>
+          contract.network.family !== NetworkFamily.EVM ||
+          contract.standard !== TokenStandard.ERC20,
+      );
+      directContracts.sort((left, right) =>
+        Number(left.network.family === NetworkFamily.EVM) -
+        Number(right.network.family === NetworkFamily.EVM),
+      );
       const depositReadinessChecked = new Set<string>();
 
-      for (const contract of contracts) {
+      for (const contract of directContracts) {
         if (!contract.network.legacyChain || !activeDepositNetworks.has(contract.network.legacyChain)) {
+          continue;
+        }
+        if (contract.network.family === NetworkFamily.EVM && !scanEvmThisRun) {
           continue;
         }
         try {
@@ -166,13 +214,43 @@ export class DepositIndexerService {
             network: contract.network,
             tokenStandard: contract.standard,
           });
+          const toBlock =
+            contract.network.family === NetworkFamily.EVM
+              ? Math.min(
+                  latest,
+                  fromBlock + this.maxBlocksPerRun(contract.network.chainKey, contract.standard) - 1,
+                )
+              : latest;
+          const recentFromBlock = this.resolveScanFromBlock({
+            stored: latest,
+            latest,
+            network: contract.network,
+            tokenStandard: contract.standard,
+          });
+
+          // Process the chain tip while an old cursor catches up in bounded chunks.
+          // Deposit writes are idempotent, and the historical cursor is not advanced
+          // across the gap until that gap has actually been scanned.
+          if (
+            contract.network.family === NetworkFamily.EVM &&
+            toBlock < recentFromBlock
+          ) {
+            await this.scanDeposits({
+              assetSymbol: contract.asset.symbol,
+              network: contract.network.chainKey,
+              fromBlock: recentFromBlock,
+              toBlock: latest,
+              latestBlock: latest,
+            });
+          }
           const result = await this.scanDeposits({
             assetSymbol: contract.asset.symbol,
             network: contract.network.chainKey,
             fromBlock,
-            toBlock: latest,
+            toBlock,
+            ...(contract.network.family === NetworkFamily.EVM ? { latestBlock: latest } : {}),
           });
-          const lastBlock = BigInt(result.latestBlock ?? latest);
+          const lastBlock = BigInt(result.toBlock ?? toBlock);
           await this.prisma.depositIndexerCursor.upsert({
             where: { key: cursorKey },
             update: { lastBlock },
@@ -191,6 +269,13 @@ export class DepositIndexerService {
           );
         }
       }
+      if (scanEvmThisRun) {
+        await this.scanConfiguredErc20ContractGroups(
+          evmErc20Contracts,
+          activeDepositNetworks,
+          depositReadinessChecked,
+        );
+      }
     } catch (error) {
       this.logger.error(
         `Deposit indexer failed: ${error instanceof Error ? error.message : 'unknown error'}`,
@@ -198,6 +283,162 @@ export class DepositIndexerService {
     } finally {
       this.running = false;
     }
+  }
+
+  private async scanConfiguredErc20ContractGroups(
+    contracts: IndexedTokenContract[],
+    activeDepositNetworks: Set<Chain>,
+    depositReadinessChecked: Set<string>,
+  ): Promise<void> {
+    const byNetwork = new Map<string, IndexedTokenContract[]>();
+    for (const contract of contracts) {
+      const legacyChain = contract.network.legacyChain;
+      if (!legacyChain || !activeDepositNetworks.has(legacyChain)) continue;
+      const bucket = byNetwork.get(contract.network.chainKey) ?? [];
+      bucket.push(contract);
+      byNetwork.set(contract.network.chainKey, bucket);
+    }
+
+    for (const networkContracts of byNetwork.values()) {
+      const network = networkContracts[0]!.network;
+      try {
+        await this.assertDepositWorkerReadyOnce(
+          depositReadinessChecked,
+          network.chainKey,
+        );
+        const latest = await this.getLatestBlock(network);
+        const plans: Erc20ScanPlan[] = [];
+
+        for (const contract of networkContracts) {
+          const cursorKey = this.cursorKey(network.chainKey, contract.id);
+          const cursor = await this.prisma.depositIndexerCursor.findUnique({
+            where: { key: cursorKey },
+          });
+          const stored = Number(cursor?.lastBlock ?? 0);
+          const fromBlock = this.resolveScanFromBlock({
+            stored,
+            latest,
+            network,
+            tokenStandard: contract.standard,
+          });
+          const toBlock = Math.min(
+            latest,
+            fromBlock + this.maxBlocksPerRun(network.chainKey, contract.standard) - 1,
+          );
+          const recentFromBlock = this.resolveScanFromBlock({
+            stored: latest,
+            latest,
+            network,
+            tokenStandard: contract.standard,
+          });
+          if (toBlock < recentFromBlock) {
+            plans.push({
+              contract,
+              fromBlock: recentFromBlock,
+              toBlock: latest,
+              latestBlock: latest,
+              advancesCursor: false,
+            });
+          }
+          plans.push({
+            contract,
+            fromBlock,
+            toBlock,
+            latestBlock: latest,
+            advancesCursor: true,
+          });
+        }
+
+        const groups = new Map<string, Erc20ScanPlan[]>();
+        for (const plan of plans) {
+          const key = [
+            plan.fromBlock,
+            plan.toBlock,
+            plan.latestBlock,
+            plan.advancesCursor ? 'cursor' : 'tip',
+          ].join(':');
+          const bucket = groups.get(key) ?? [];
+          bucket.push(plan);
+          groups.set(key, bucket);
+        }
+
+        for (const group of groups.values()) {
+          const completed: Erc20ScanPlan[] = [];
+          try {
+            await this.scanErc20Targets(
+              {
+                networkKey: network.chainKey,
+                fromBlock: group[0]!.fromBlock,
+                toBlock: group[0]!.toBlock,
+                latestBlock: group[0]!.latestBlock,
+              },
+              group.map((plan) => this.indexedContractTarget(plan.contract)),
+            );
+            completed.push(...group);
+          } catch (batchError) {
+            this.logger.warn(
+              `Batched ERC20 deposit scan failed on ${network.chainKey}; falling back to individual contracts: ${
+                batchError instanceof Error ? batchError.message : 'unknown error'
+              }`,
+            );
+            for (const plan of group) {
+              try {
+                await this.scanErc20Deposits(
+                  {
+                    assetSymbol: plan.contract.asset.symbol,
+                    network: network.chainKey,
+                    fromBlock: plan.fromBlock,
+                    toBlock: plan.toBlock,
+                    latestBlock: plan.latestBlock,
+                  },
+                  this.indexedContractTarget(plan.contract),
+                );
+                completed.push(plan);
+              } catch (error) {
+                this.logger.warn(
+                  `Deposit indexer skipped ${plan.contract.asset.symbol} on ${network.chainKey}: ${
+                    error instanceof Error ? error.message : 'unknown error'
+                  }`,
+                );
+              }
+            }
+          }
+
+          for (const plan of completed.filter((item) => item.advancesCursor)) {
+            const cursorKey = this.cursorKey(network.chainKey, plan.contract.id);
+            const lastBlock = BigInt(plan.toBlock);
+            await this.prisma.depositIndexerCursor.upsert({
+              where: { key: cursorKey },
+              update: { lastBlock },
+              create: {
+                key: cursorKey,
+                networkId: plan.contract.networkId,
+                tokenContractId: plan.contract.id,
+                lastBlock,
+              },
+            });
+          }
+        }
+      } catch (error) {
+        this.logger.warn(
+          `Deposit indexer skipped ERC20 batch on ${network.chainKey}: ${
+            error instanceof Error ? error.message : 'unknown error'
+          }`,
+        );
+      }
+    }
+  }
+
+  private indexedContractTarget(contract: IndexedTokenContract): Erc20Target {
+    if (!contract.network.legacyChain) {
+      throw new BadRequestException('Network is missing legacy storage mapping');
+    }
+    return {
+      asset: contract.asset,
+      tokenContract: contract,
+      network: contract.network,
+      legacyChain: contract.network.legacyChain,
+    };
   }
 
   async reconcilePendingDeposits(): Promise<void> {
@@ -326,45 +567,97 @@ export class DepositIndexerService {
       network?: string;
       fromBlock: number;
       toBlock?: number;
+      latestBlock?: number;
       userId?: string;
     },
-    existingTarget?: Awaited<ReturnType<DepositIndexerService['getScanTarget']>>,
+    existingTarget?: Erc20Target,
   ) {
     const target = existingTarget ?? await this.getScanTarget(input.assetSymbol, input.network);
-    const { asset, tokenContract, network } = target;
-    if (tokenContract.standard !== TokenStandard.ERC20) {
-      throw new BadRequestException('Only ERC20 token assets can be indexed by this scanner');
-    }
-    if (
-      (!tokenContract.contractVerifiedAt || !tokenContract.contractCodeHash) &&
-      (!asset.contractVerifiedAt || !asset.contractCodeHash)
-    ) {
-      throw new BadRequestException('Asset contract is not verified');
+    const { asset, network } = target;
+    const latestBlock =
+      input.latestBlock ?? (await this.rpcProvider.getLatestBlockNumber(network.chainKey));
+    const toBlock = input.toBlock ?? latestBlock;
+    const result = await this.scanErc20Targets(
+      {
+        networkKey: network.chainKey,
+        fromBlock: input.fromBlock,
+        toBlock,
+        latestBlock,
+        userId: input.userId,
+      },
+      [target],
+    );
+    return {
+      asset: asset.symbol,
+      network: network.chainKey,
+      fromBlock: input.fromBlock,
+      toBlock,
+      latestBlock,
+      scannedLogs: result.scannedLogs,
+      deposits: result.deposits,
+    };
+  }
+
+  private async scanErc20Targets(
+    input: {
+      networkKey: string;
+      fromBlock: number;
+      toBlock: number;
+      latestBlock: number;
+      userId?: string;
+    },
+    targets: Erc20Target[],
+  ) {
+    const first = targets[0];
+    if (!first) return { scannedLogs: 0, deposits: [] };
+    for (const target of targets) {
+      const { asset, tokenContract, network } = target;
+      if (
+        network.chainKey !== first.network.chainKey ||
+        target.legacyChain !== first.legacyChain
+      ) {
+        throw new BadRequestException('ERC20 batch must use one network');
+      }
+      if (tokenContract.standard !== TokenStandard.ERC20 || !tokenContract.address) {
+        throw new BadRequestException('Only ERC20 token assets can be indexed by this scanner');
+      }
+      if (
+        (!tokenContract.contractVerifiedAt || !tokenContract.contractCodeHash) &&
+        (!asset.contractVerifiedAt || !asset.contractCodeHash)
+      ) {
+        throw new BadRequestException('Asset contract is not verified');
+      }
     }
 
-    const latestBlock = await this.rpcProvider.getLatestBlockNumber(network.chainKey);
-    const toBlock = input.toBlock ?? latestBlock;
     const personalAddresses = await this.prisma.userDepositAddress.findMany({
       where: {
-        network: target.legacyChain,
+        network: first.legacyChain,
         status: 'ACTIVE',
         ...(input.userId ? { userId: input.userId } : {}),
       },
       select: { id: true, userId: true, address: true },
     });
     const batchSize = this.config.get<number>('DEPOSIT_ADDRESS_SCAN_BATCH_SIZE', 100);
-    const blockRanges = this.blockRanges(input.fromBlock, toBlock);
-    const logs = [];
-    for (let offset = 0; offset < personalAddresses.length; offset += batchSize) {
-      const batch = personalAddresses.slice(offset, offset + batchSize);
+    const blockRanges = this.blockRanges(input.fromBlock, input.toBlock, input.networkKey);
+    const logs: RpcLog[] = [];
+    const treasuryAddress = input.userId
+      ? null
+      : await this.depositsService.getActiveTreasuryAddress(first.legacyChain);
+    const scanAddresses = [
+      ...personalAddresses.map((address) => address.address),
+      ...(treasuryAddress ? [treasuryAddress] : []),
+    ];
+    const tokenAddresses = targets.map((target) => target.tokenContract.address!);
+    for (let offset = 0; offset < scanAddresses.length; offset += batchSize) {
+      const batch = scanAddresses.slice(offset, offset + batchSize);
       for (const range of blockRanges) {
-        const destinationTopics = batch.map((address) => this.addressToTopic(address.address));
+        const destinationTopics = batch.map((address) => this.addressToTopic(address));
         const destinationTopic =
           destinationTopics.length === 1 ? destinationTopics[0]! : destinationTopics;
         logs.push(
           ...(await this.fetchTransferLogs({
-            networkKey: network.chainKey,
-            tokenAddress: tokenContract.address!,
+            networkKey: input.networkKey,
+            tokenAddress: tokenAddresses.length === 1 ? tokenAddresses[0]! : tokenAddresses,
             destinationTopic,
             fromBlock: range.fromBlock,
             toBlock: range.toBlock,
@@ -375,26 +668,15 @@ export class DepositIndexerService {
     const addressByDestination = new Map(
       personalAddresses.map((address) => [address.address.toLowerCase(), address]),
     );
-
-    // Personal sync only needs deposit-address logs. Scanning treasury on busy
-    // chains like BNB can exceed eth_getLogs limits even for small block ranges.
-    if (!input.userId) {
-      const treasuryAddress = await this.depositsService.getActiveTreasuryAddress(target.legacyChain);
-      for (const range of blockRanges) {
-        logs.push(
-          ...(await this.fetchTransferLogs({
-            networkKey: network.chainKey,
-            tokenAddress: tokenContract.address!,
-            destinationTopic: this.addressToTopic(treasuryAddress),
-            fromBlock: range.fromBlock,
-            toBlock: range.toBlock,
-          })),
-        );
-      }
-    }
+    const targetByContract = new Map(
+      targets.map((target) => [target.tokenContract.address!.toLowerCase(), target]),
+    );
 
     const deposits = [];
     for (const log of logs) {
+      const target = targetByContract.get(log.address.toLowerCase());
+      if (!target) continue;
+      const { asset, tokenContract, network } = target;
       const parsed = decodeEventLog({
         abi: [TRANSFER_EVENT],
         topics: log.topics as [Hex, ...Hex[]],
@@ -409,7 +691,7 @@ export class DepositIndexerService {
       const fromAddress = getAddress(args.from);
       const toAddress = getAddress(args.to);
       const amount = formatUnits(args.value, tokenContract.decimals);
-      const confirmations = Math.max(0, latestBlock - log.blockNumber + 1);
+      const confirmations = Math.max(0, input.latestBlock - log.blockNumber + 1);
       const personalAddress = addressByDestination.get(toAddress.toLowerCase());
       const intent = await this.prisma.depositIntent.findFirst({
         where: {
@@ -443,7 +725,7 @@ export class DepositIndexerService {
         (await this.depositsService.shouldSkipInternalPersonalDepositTransfer({
           userId: personalAddress.userId,
           fromAddress,
-          network: target.legacyChain,
+          network: first.legacyChain,
         }))
       ) {
         continue;
@@ -453,7 +735,7 @@ export class DepositIndexerService {
           intentId: intent?.id,
           depositAddressId: personalAddress?.id,
           userId: personalAddress?.userId,
-          network: target.legacyChain,
+          network: first.legacyChain,
           tokenContractId: tokenContract.id,
           requireIntent: !personalAddress,
           channel: intent ? 'WEB3_INTENT' : personalAddress ? 'PERSONAL_ADDRESS' : 'UNMATCHED',
@@ -471,11 +753,6 @@ export class DepositIndexerService {
     }
 
     return {
-      asset: asset.symbol,
-      network: network.chainKey,
-      fromBlock: input.fromBlock,
-      toBlock,
-      latestBlock,
       scannedLogs: logs.length,
       deposits,
     };
@@ -563,27 +840,24 @@ export class DepositIndexerService {
             contract.network.chainKey,
           );
           const latest = await this.getLatestBlock(contract.network);
-          const lookback = contract.standard === TokenStandard.NATIVE
-            ? this.config.get<number>('DEPOSIT_PERSONAL_NATIVE_SYNC_LOOKBACK_BLOCKS', 20)
-            : this.config.get<number>('DEPOSIT_PERSONAL_SYNC_LOOKBACK_BLOCKS', 5000);
+          const configuredLookback = contract.standard === TokenStandard.NATIVE
+            ? this.config.get<number>('DEPOSIT_PERSONAL_NATIVE_SYNC_LOOKBACK_BLOCKS', 20) ?? 20
+            : this.config.get<number>('DEPOSIT_PERSONAL_SYNC_LOOKBACK_BLOCKS', 5000) ?? 5000;
+          const lookback = Math.min(
+            configuredLookback,
+            this.maxPersonalScanBlocks(contract.network.chainKey, contract.standard),
+          );
           // Personal sync must catch up history for newly provisioned addresses.
           // The global indexer cursor only scans forward and would skip past deposits.
           const fromBlock = Math.max(0, latest - lookback);
-          const scanResult = await this.withPersonalSyncTimeout(
-            this.scanDeposits({
-              assetSymbol: contract.asset.symbol,
-              network: contract.network.chainKey,
-              fromBlock,
-              toBlock: latest,
-              userId,
-            }),
-            `${contract.asset.symbol} on ${contract.network.chainKey}`,
-          );
-          if (scanResult === undefined) {
-            this.logger.warn(
-              `Personal deposit log scan timed out for ${contract.asset.symbol} on ${contract.network.chainKey}; using balance reconcile`,
-            );
-          }
+          await this.scanDeposits({
+            assetSymbol: contract.asset.symbol,
+            network: contract.network.chainKey,
+            fromBlock,
+            toBlock: latest,
+            latestBlock: latest,
+            userId,
+          });
         } catch (error) {
           this.logger.warn(
             `Personal deposit sync skipped ${contract.asset.symbol} on ${contract.network.chainKey} for ${userId}: ${
@@ -662,6 +936,7 @@ export class DepositIndexerService {
     network?: string;
     fromBlock: number;
     toBlock?: number;
+    latestBlock?: number;
     userId?: string;
   }) {
     const target = await this.getScanTarget(input.assetSymbol, input.network);
@@ -674,6 +949,9 @@ export class DepositIndexerService {
         },
         select: { id: true, userId: true, address: true },
       });
+      if (target.network.family === NetworkFamily.TVM) {
+        return this.scanTronDepositsWithAddressCursors(input, target, personalAddresses);
+      }
       const result = await this.nonEvm.scanDeposits({
         asset: target.asset,
         tokenContract: {
@@ -715,6 +993,7 @@ export class DepositIndexerService {
       network?: string;
       fromBlock: number;
       toBlock?: number;
+      latestBlock?: number;
       userId?: string;
     },
     existingTarget?: Awaited<ReturnType<DepositIndexerService['getScanTarget']>>,
@@ -738,7 +1017,8 @@ export class DepositIndexerService {
       ).map((account) => account.address.toLowerCase()),
     );
 
-    const latestBlock = await this.rpcProvider.getLatestBlockNumber(network.chainKey);
+    const latestBlock =
+      input.latestBlock ?? (await this.rpcProvider.getLatestBlockNumber(network.chainKey));
     const toBlock = input.toBlock ?? latestBlock;
     const personalAddresses = await this.prisma.userDepositAddress.findMany({
       where: {
@@ -814,8 +1094,8 @@ export class DepositIndexerService {
     return `0x${'0'.repeat(24)}${getAddress(address).slice(2).toLowerCase()}`;
   }
 
-  private blockRanges(fromBlock: number, toBlock: number) {
-    const maxRange = this.config.get<number>('DEPOSIT_INDEXER_MAX_BLOCK_RANGE', 250);
+  private blockRanges(fromBlock: number, toBlock: number, networkKey: string) {
+    const maxRange = this.maxBlockRange(networkKey);
     const ranges: Array<{ fromBlock: number; toBlock: number }> = [];
     for (let from = fromBlock; from <= toBlock; from += maxRange) {
       ranges.push({
@@ -828,7 +1108,7 @@ export class DepositIndexerService {
 
   private async fetchTransferLogs(input: {
     networkKey: string;
-    tokenAddress: string;
+    tokenAddress: string | string[];
     destinationTopic: string | string[];
     fromBlock: number;
     toBlock: number;
@@ -867,6 +1147,18 @@ export class DepositIndexerService {
 
   private isBalanceFallbackEnabled(): boolean {
     return this.config.get<boolean>('DEPOSIT_INDEXER_BALANCE_FALLBACK_ENABLED', true);
+  }
+
+  private shouldRunEvmFallbackScan(now = Date.now()): boolean {
+    if (!this.config.get<boolean>('ALCHEMY_ADDRESS_ACTIVITY_ENABLED', false)) {
+      return true;
+    }
+    const intervalMs = this.config.get<number>('DEPOSIT_EVM_FALLBACK_SCAN_MS', 300_000);
+    if (now - this.lastEvmFallbackScanAt < intervalMs) {
+      return false;
+    }
+    this.lastEvmFallbackScanAt = now;
+    return true;
   }
 
   async reconcileAllPersonalDepositBalances(): Promise<{ reconciled: number }> {
@@ -1011,11 +1303,14 @@ export class DepositIndexerService {
       return false;
     }
     if (network.family === NetworkFamily.EVM) {
-      return tokenContract.standard === TokenStandard.ERC20;
+      return (
+        this.config.get<boolean>('DEPOSIT_EVM_BALANCE_RECONCILE_ENABLED', false) &&
+        tokenContract.standard === TokenStandard.ERC20
+      );
     }
-    if (network.family === NetworkFamily.TVM) {
-      return tokenContract.standard === TokenStandard.TRC20;
-    }
+    // Tron balances are only a reconciliation signal. A swept address can receive
+    // the same amount again, so a lifetime balance delta cannot identify a deposit.
+    if (network.family === NetworkFamily.TVM) return false;
     if (network.family === NetworkFamily.SVM) {
       return tokenContract.standard === TokenStandard.SPL;
     }
@@ -1260,40 +1555,6 @@ export class DepositIndexerService {
     return `deposit-indexer:${networkKey}:${tokenContractId}`;
   }
 
-  private async withPersonalSyncTimeout<T>(
-    promise: Promise<T>,
-    label: string,
-  ): Promise<T | undefined> {
-    const timeoutMs = this.config.get<number>('DEPOSIT_PERSONAL_SYNC_TIMEOUT_MS', 30_000);
-    let timer: NodeJS.Timeout | undefined;
-    let timedOut = false;
-    try {
-      return await Promise.race([
-        promise,
-        new Promise<undefined>((resolve) => {
-          timer = setTimeout(() => {
-            timedOut = true;
-            resolve(undefined);
-          }, timeoutMs);
-        }),
-      ]);
-    } catch (error) {
-      this.logger.warn(
-        `Personal deposit sync failed for ${label}: ${
-          error instanceof Error ? error.message : 'unknown error'
-        }`,
-      );
-      return undefined;
-    } finally {
-      if (timer) {
-        clearTimeout(timer);
-      }
-      if (timedOut) {
-        this.logger.warn(`Personal deposit sync timed out after ${timeoutMs}ms for ${label}`);
-      }
-    }
-  }
-
   private async recordNonEvmDetectedDeposits(input: {
     asset: { id: string };
     tokenContract: {
@@ -1301,6 +1562,7 @@ export class DepositIndexerService {
       address: string | null;
       decimals: number;
       standard: TokenStandard;
+      minDepositAmount?: { toString(): string };
     };
     network: Network;
     legacyChain: Chain;
@@ -1319,6 +1581,16 @@ export class DepositIndexerService {
   }) {
     const deposits = [];
     for (const detected of input.detected) {
+      const belowMinimum = new Prisma.Decimal(detected.amount).lessThan(
+        new Prisma.Decimal(input.tokenContract.minDepositAmount?.toString() ?? '0'),
+      );
+      const internalTronGas = input.network.family === NetworkFamily.TVM &&
+        input.tokenContract.standard === TokenStandard.NATIVE &&
+        await this.depositsService.isInternalTronSweepGasFunding({
+          txHash: detected.txHash,
+          fromAddress: detected.fromAddress,
+        });
+      const forceUnmatched = belowMinimum || internalTronGas;
       const intent = await this.prisma.depositIntent.findFirst({
         where: {
           assetId: input.asset.id,
@@ -1331,6 +1603,8 @@ export class DepositIndexerService {
         orderBy: { createdAt: 'asc' },
       });
       if (
+        !forceUnmatched &&
+        input.network.family !== NetworkFamily.TVM &&
         await this.shouldSkipPersonalDepositDetection({
           depositAddressId: detected.depositAddressId,
           tokenContractId: input.tokenContract.id,
@@ -1353,9 +1627,9 @@ export class DepositIndexerService {
       }
       deposits.push(
         await this.depositsService.recordDetectedDeposit({
-          intentId: intent?.id,
+          intentId: forceUnmatched ? undefined : intent?.id,
           depositAddressId: detected.depositAddressId,
-          userId: detected.userId,
+          userId: forceUnmatched ? undefined : detected.userId,
           network: input.legacyChain,
           tokenContractId: input.tokenContract.id,
           channel: 'PERSONAL_ADDRESS',
@@ -1363,22 +1637,137 @@ export class DepositIndexerService {
           fromAddress: detected.fromAddress,
           toAddress: detected.toAddress,
           txHash: detected.txHash,
-          logIndex: detected.outputIndex,
+          logIndex:
+            input.tokenContract.standard === TokenStandard.NATIVE
+              ? undefined
+              : detected.outputIndex,
           blockNumber: detected.blockNumber,
           amount: detected.amount,
           rawAmount: detected.rawAmount,
           confirmations: detected.confirmations,
+          forceUnmatched,
         }),
       );
     }
     return deposits;
   }
 
-  private async getLatestBlock(network: Network): Promise<number> {
-    if (network.family === NetworkFamily.EVM) {
-      return this.rpcProvider.getLatestBlockNumber(network.chainKey);
+  private async scanTronDepositsWithAddressCursors(
+    input: {
+      assetSymbol: string;
+      network?: string;
+      fromBlock: number;
+      toBlock?: number;
+      latestBlock?: number;
+      userId?: string;
+    },
+    target: Awaited<ReturnType<DepositIndexerService['getScanTarget']>>,
+    personalAddresses: Array<{ id: string; userId: string; address: string }>,
+  ) {
+    const deposits = [];
+    let latestBlock = input.latestBlock ?? 0;
+    let toBlock = input.toBlock ?? 0;
+    let scannedTransactions = 0;
+    const overlapMs = this.config.get<number>('TRON_SCAN_TIMESTAMP_OVERLAP_MS', 60_000);
+    const fixedToTimestampMs = Date.now();
+    const stream = `${target.tokenContract.standard}:${target.tokenContract.id}`;
+
+    for (const personalAddress of personalAddresses) {
+      const key = `tron:${target.network.id}:${personalAddress.id}:${stream}`;
+      const cursor = await this.prisma.tronDepositScanCursor.findUnique({ where: { key } });
+      const storedTimestamp = Number(cursor?.lastTimestampMs ?? 0);
+      const fromTimestampMs = Math.max(0, storedTimestamp - overlapMs);
+      const result = await this.nonEvm.scanDeposits({
+        asset: target.asset,
+        tokenContract: {
+          ...target.tokenContract,
+          network: target.network,
+          asset: target.asset,
+        },
+        fromBlock: input.fromBlock,
+        toBlock: input.toBlock,
+        fromTimestampMs,
+        toTimestampMs: fixedToTimestampMs,
+        personalAddresses: [personalAddress],
+      });
+      const recorded = await this.recordNonEvmDetectedDeposits({
+        asset: target.asset,
+        tokenContract: target.tokenContract,
+        network: target.network,
+        legacyChain: target.legacyChain,
+        detected: result.deposits,
+      });
+      deposits.push(...recorded);
+      latestBlock = Math.max(latestBlock, result.latestBlock);
+      toBlock = Math.max(toBlock, result.toBlock);
+      scannedTransactions += result.scannedTransactions;
+      const lastTimestampMs = BigInt(result.toTimestampMs ?? fixedToTimestampMs);
+      await this.prisma.tronDepositScanCursor.upsert({
+        where: { key },
+        update: {
+          lastTimestampMs,
+          lastBlock: result.toBlock,
+        },
+        create: {
+          key,
+          networkId: target.network.id,
+          depositAddressId: personalAddress.id,
+          stream,
+          lastTimestampMs,
+          lastBlock: result.toBlock,
+        },
+      });
     }
-    return this.nonEvm.getLatestBlock(network);
+
+    return {
+      asset: target.asset.symbol,
+      network: target.network.chainKey,
+      fromBlock: input.fromBlock,
+      toBlock,
+      latestBlock,
+      scannedLogs: 0,
+      scannedTransactions,
+      deposits,
+    };
+  }
+
+  private async getLatestBlock(network: Network): Promise<number> {
+    const key = network.chainKey.toLowerCase();
+    const cached = this.latestBlockCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.value;
+    }
+    const value = network.family === NetworkFamily.EVM
+      ? this.rpcProvider.getLatestBlockNumber(network.chainKey)
+      : this.nonEvm.getLatestBlock(network);
+    this.latestBlockCache.set(key, { expiresAt: Date.now() + 2_000, value });
+    try {
+      return await value;
+    } catch (error) {
+      this.latestBlockCache.delete(key);
+      throw error;
+    }
+  }
+
+  private maxBlockRange(networkKey: string): number {
+    const configured = this.config.get<number>('DEPOSIT_INDEXER_MAX_BLOCK_RANGE', 250) ?? 250;
+    return networkKey === 'bnb' || networkKey === 'bnb-testnet'
+      ? Math.min(configured, 10)
+      : configured;
+  }
+
+  private maxBlocksPerRun(networkKey: string, standard: TokenStandard): number {
+    if (standard === TokenStandard.NATIVE) {
+      return this.config.get<number>('DEPOSIT_PERSONAL_NATIVE_SYNC_LOOKBACK_BLOCKS', 20) ?? 20;
+    }
+    return this.maxBlockRange(networkKey) * 5;
+  }
+
+  private maxPersonalScanBlocks(networkKey: string, standard: TokenStandard): number {
+    if (standard === TokenStandard.NATIVE) {
+      return this.config.get<number>('DEPOSIT_PERSONAL_NATIVE_SYNC_LOOKBACK_BLOCKS', 20) ?? 20;
+    }
+    return this.maxBlockRange(networkKey) * (networkKey.startsWith('bnb') ? 20 : 5);
   }
 
   private resolveScanFromBlock(input: {
@@ -1398,9 +1787,9 @@ export class DepositIndexerService {
       'DEPOSIT_INDEXER_REORG_OVERLAP_BLOCKS',
       30,
     );
-    const overlap =
-      input.network.family === NetworkFamily.EVM &&
-      input.tokenStandard === TokenStandard.NATIVE
+    const overlap = input.network.family !== NetworkFamily.EVM
+      ? input.network.reorgOverlapBlocks
+      : input.tokenStandard === TokenStandard.NATIVE
         ? this.config.get<number>('DEPOSIT_INDEXER_NATIVE_REORG_OVERLAP_BLOCKS', 2)
         : Math.min(input.network.reorgOverlapBlocks, configuredOverlap);
     return Math.max(0, anchor - overlap);

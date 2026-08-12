@@ -77,6 +77,26 @@ describe('ViemRpcProvider wallet signature verification', () => {
     jest.useRealTimers();
   });
 
+  it('coalesces latest block reads inside the short cache window', async () => {
+    global.fetch = jest.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x10' }),
+        { status: 200 },
+      ),
+    );
+    const provider = new ViemRpcProvider(
+      createConfig({ ARBITRUM_RPC_PRIMARY_URL: 'https://rpc.example.test' }),
+    );
+
+    await expect(
+      Promise.all([
+        provider.getLatestBlockNumber('arbitrum'),
+        provider.getLatestBlockNumber('arbitrum'),
+      ]),
+    ).resolves.toEqual([16, 16]);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
   function createConfig(overrides: Record<string, unknown> = {}): ConfigService {
     const values: Record<string, unknown> = {
       ARBITRUM_RPC_PRIMARY_URL: '',

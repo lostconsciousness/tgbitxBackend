@@ -5,6 +5,8 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  OnModuleInit,
+  Optional,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -28,6 +30,7 @@ import { RPC_PROVIDER } from '../rpc/rpc.module';
 import { RpcProvider } from '../rpc/rpc-provider.interface';
 import { OneInchSwapProviderService } from '../spot/one-inch-swap-provider.service';
 import { PrivyCustodyService } from '../treasury/privy-custody.service';
+import { UserUpdatesService } from '../user-updates/user-updates.service';
 import { CreateConversionQuoteDto } from './dto/create-conversion-quote.dto';
 import { ExecuteConversionDto } from './dto/execute-conversion.dto';
 
@@ -72,13 +75,47 @@ type EvmRoute = {
   toNative: boolean;
 };
 
+type SpotTicker = {
+  symbol: string;
+  provider: 'ONEINCH_SPOT_PRICE';
+  network: string;
+  lastPrice: string;
+  markPrice: string;
+  priceChange24h: string | null;
+  priceChangePct24h: string | null;
+  volume24h: string | null;
+  notional24h: string | null;
+  statsProvider: 'HYPERLIQUID_PERP_REFERENCE' | null;
+  time: number;
+};
+
 class PendingProviderTransactionError extends Error {}
 class ManualReconciliationRequiredError extends Error {}
 
 @Injectable()
-export class ConvertService {
+export class ConvertService implements OnModuleInit {
   private readonly logger = new Logger(ConvertService.name);
   private workerRunning = false;
+  private spotLiquidityCache?: {
+    key: string;
+    expiresAt: number;
+    value: Map<string, Set<string>>;
+  };
+  private spotLiquidityRefresh?: Promise<Map<string, Set<string>>>;
+  private spotTickerCache?: { expiresAt: number; value: SpotTicker[] };
+  private spotTickerRefresh?: Promise<SpotTicker[]>;
+  private spotCatalogCache?: {
+    expiresAt: number;
+    value: Awaited<ReturnType<ConvertService['buildSpotCatalog']>>;
+  };
+  private spotCatalogRefresh?: Promise<
+    Awaited<ReturnType<ConvertService['buildSpotCatalog']>>
+  >;
+  private readinessCache?: {
+    expiresAt: number;
+    value: Awaited<ReturnType<ConvertService['computeReadiness']>>;
+  };
+  private readinessRefresh?: Promise<Awaited<ReturnType<ConvertService['computeReadiness']>>>;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -88,10 +125,21 @@ export class ConvertService {
     private readonly oneInch: OneInchSwapProviderService,
     private readonly custody: PrivyCustodyService,
     @Inject(RPC_PROVIDER) private readonly rpc: RpcProvider,
+    @Optional() private readonly userUpdates?: UserUpdatesService,
   ) {}
+
+  onModuleInit(): void {
+    const timer = setTimeout(() => {
+      void this.refreshSpotCatalog().catch((error) => {
+        this.logger.warn(`Spot catalog warmup failed: ${this.safeError(error)}`);
+      });
+    }, 250);
+    timer.unref();
+  }
 
   async listAssets() {
     const supportedNetworkKeys = this.evmNetworkPreference();
+    const convertEnabled = this.config.get<boolean>('CONVERT_ENABLED', false);
     const assets = await this.prisma.asset.findMany({
       where: {
         OR: [
@@ -122,11 +170,13 @@ export class ConvertService {
     return assets.map((asset) => {
       const sol = asset.symbol === 'SOL';
       const tron = asset.symbol === 'TRX';
-      const enabled = sol
+      const enabled = convertEnabled && (sol
         ? this.config.get<boolean>('CONVERT_SOL_ENABLED', false) && this.custody.isSolanaEnabled()
         : tron
           ? this.config.get<boolean>('CONVERT_TRON_ENABLED', false) && this.custody.isTronEnabled()
-          : this.config.get<boolean>('CONVERT_EVM_ENABLED', false) && this.oneInch.getStatus().enabled;
+          : this.config.get<boolean>('CONVERT_EVM_ENABLED', false) &&
+            this.oneInch.getStatus().enabled &&
+            Boolean(this.config.get<string>('PRIVY_SPOT_LIQUIDITY_WALLET_ID')));
       const networks = asset.tokenContracts
         .map((contract) => contract.network.chainKey)
         .filter((key) => ONEINCH_EVM_NETWORKS.has(key));
@@ -134,6 +184,7 @@ export class ConvertService {
         symbol: asset.symbol,
         name: asset.name,
         iconUrl: asset.iconUrl,
+        decimals: asset.decimals,
         enabled,
         provider: sol || tron ? ConversionProvider.INTERNAL_RESERVE : ConversionProvider.ONEINCH,
         networks: sol ? [SOLANA_NETWORK] : tron ? [TRON_NETWORK] : [...new Set(networks)],
@@ -149,7 +200,338 @@ export class ConvertService {
     });
   }
 
+  async listSpotCatalog(): Promise<
+    Awaited<ReturnType<ConvertService['buildSpotCatalog']>>
+  > {
+    const cached = this.spotCatalogCache;
+    if (cached) {
+      if (cached.expiresAt <= Date.now()) {
+        void this.refreshSpotCatalog().catch((error) => {
+          this.logger.warn(`Spot catalog background refresh failed: ${this.safeError(error)}`);
+        });
+      }
+      return cached.value;
+    }
+    return this.refreshSpotCatalog();
+  }
+
+  private refreshSpotCatalog(): Promise<
+    Awaited<ReturnType<ConvertService['buildSpotCatalog']>>
+  > {
+    if (this.spotCatalogRefresh) return this.spotCatalogRefresh;
+    this.spotCatalogRefresh = this.buildSpotCatalog()
+      .then((value) => {
+        this.spotCatalogCache = {
+          value,
+          expiresAt:
+            Date.now() + this.config.get<number>('CONVERT_SPOT_CATALOG_CACHE_MS', 60_000),
+        };
+        return value;
+      })
+      .finally(() => {
+        this.spotCatalogRefresh = undefined;
+      });
+    return this.spotCatalogRefresh;
+  }
+
+  private async buildSpotCatalog() {
+    const configuredAssets = await this.listAssets();
+    const preference = this.spotCatalogNetworkPreference();
+    const fundedQuotes = await this.getSpotCatalogFundedQuotes(preference);
+    const quoteSymbols = ['USDC', 'USDT'];
+    const executableAssets = configuredAssets.filter(
+      (asset) => asset.enabled && asset.provider === ConversionProvider.ONEINCH,
+    );
+    const quoteAssets = new Map(
+      executableAssets
+        .filter((asset) => quoteSymbols.includes(asset.symbol))
+        .map((asset) => [asset.symbol, asset]),
+    );
+    const pairs: Array<{
+      pairKey: string;
+      symbol: string;
+      baseAsset: string;
+      quoteAsset: string;
+      provider: ConversionProvider;
+      execution: 'CONVERT';
+      preferredNetwork: string;
+      networks: string[];
+    }> = [];
+
+    for (const base of executableAssets) {
+      if (quoteSymbols.includes(base.symbol)) continue;
+      for (const quoteSymbol of quoteSymbols) {
+        const quote = quoteAssets.get(quoteSymbol);
+        if (!quote) continue;
+        const networks = preference.filter(
+          (network) =>
+            base.networks.includes(network) &&
+            quote.networks.includes(network) &&
+            fundedQuotes.get(network)?.has(quote.symbol),
+        );
+        if (networks.length === 0) continue;
+        pairs.push({
+          pairKey: `convert:${base.symbol}-${quote.symbol}`,
+          symbol: `${base.symbol}-${quote.symbol}`,
+          baseAsset: base.symbol,
+          quoteAsset: quote.symbol,
+          provider: ConversionProvider.ONEINCH,
+          execution: 'CONVERT',
+          preferredNetwork: networks[0]!,
+          networks,
+        });
+      }
+    }
+
+    const usdc = quoteAssets.get('USDC');
+    const usdt = quoteAssets.get('USDT');
+    if (usdc && usdt) {
+      const networks = preference.filter(
+        (network) =>
+          usdc.networks.includes(network) &&
+          usdt.networks.includes(network) &&
+          (fundedQuotes.get(network)?.has('USDC') || fundedQuotes.get(network)?.has('USDT')),
+      );
+      if (networks.length > 0) {
+        pairs.push({
+          pairKey: 'convert:USDT-USDC',
+          symbol: 'USDT-USDC',
+          baseAsset: 'USDT',
+          quoteAsset: 'USDC',
+          provider: ConversionProvider.ONEINCH,
+          execution: 'CONVERT',
+          preferredNetwork: networks[0]!,
+          networks,
+        });
+      }
+    }
+
+    const tickers = await this.getSpotTickers(pairs).catch((error) => {
+      this.logger.warn(`Spot ticker refresh failed: ${error instanceof Error ? error.message : 'unknown error'}`);
+      return this.spotTickerCache?.value ?? [];
+    });
+    const tickerBySymbol = new Map(tickers.map((ticker) => [ticker.symbol, ticker]));
+    const executablePairs = pairs
+      .filter((pair) => tickerBySymbol.has(pair.symbol))
+      .map((pair) => ({ ...pair, ticker: tickerBySymbol.get(pair.symbol)! }))
+      .sort((left, right) => {
+        const volumeOrder = this.spotNotional(right.ticker.notional24h)
+          .comparedTo(this.spotNotional(left.ticker.notional24h));
+        return volumeOrder || left.symbol.localeCompare(right.symbol);
+      });
+    const tradableSymbols = new Set(
+      executablePairs.flatMap((pair) => [pair.baseAsset, pair.quoteAsset]),
+    );
+    const tradableNetworks = new Map<string, Set<string>>();
+    for (const pair of executablePairs) {
+      for (const symbol of [pair.baseAsset, pair.quoteAsset]) {
+        const networks = tradableNetworks.get(symbol) ?? new Set<string>();
+        pair.networks.forEach((network) => networks.add(network));
+        tradableNetworks.set(symbol, networks);
+      }
+    }
+    const assetRank = new Map<string, number>();
+    executablePairs.forEach((pair, index) => {
+      if (!assetRank.has(pair.baseAsset)) assetRank.set(pair.baseAsset, index);
+    });
+    const rankedAssets = executableAssets
+      .filter((asset) => tradableSymbols.has(asset.symbol))
+      .sort((left, right) => {
+        const leftRank = assetRank.get(left.symbol) ?? Number.MAX_SAFE_INTEGER;
+        const rightRank = assetRank.get(right.symbol) ?? Number.MAX_SAFE_INTEGER;
+        return leftRank - rightRank || left.symbol.localeCompare(right.symbol);
+      });
+
+    return {
+      execution: 'CONVERT' as const,
+      provider: ConversionProvider.ONEINCH,
+      catalogVersion: 'spot-liquidity-v3',
+      asOf: Date.now(),
+      assets: rankedAssets
+        .map(({ enabled: _enabled, reason: _reason, networkHidden: _hidden, ...asset }) => ({
+          ...asset,
+          networks: asset.networks.filter((network) => tradableNetworks.get(asset.symbol)?.has(network)),
+          tradable: true,
+        })),
+      pairs: executablePairs,
+      tickers: executablePairs.map((pair) => pair.ticker),
+    };
+  }
+
+  async listSpotTickers() {
+    const catalog = await this.listSpotCatalog();
+    return { provider: 'ONEINCH_SPOT_PRICE' as const, tickers: catalog.tickers };
+  }
+
+  private async getSpotTickers(pairs: Array<{
+    symbol: string;
+    baseAsset: string;
+    quoteAsset: string;
+    preferredNetwork: string;
+  }>): Promise<SpotTicker[]> {
+    const cached = this.spotTickerCache;
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+    if (this.spotTickerRefresh) return this.spotTickerRefresh;
+    this.spotTickerRefresh = this.loadSpotTickers(pairs)
+      .then((value) => {
+        this.spotTickerCache = {
+          value,
+          expiresAt: Date.now() + this.config.get<number>('CONVERT_SPOT_TICKER_CACHE_MS', 15_000),
+        };
+        return value;
+      })
+      .finally(() => {
+        this.spotTickerRefresh = undefined;
+      });
+    return this.spotTickerRefresh;
+  }
+
+  private async loadSpotTickers(pairs: Array<{
+    symbol: string;
+    baseAsset: string;
+    quoteAsset: string;
+    preferredNetwork: string;
+  }>): Promise<SpotTicker[]> {
+    if (pairs.length === 0) return [];
+    const symbols = [...new Set(pairs.flatMap((pair) => [pair.baseAsset, pair.quoteAsset]))];
+    const assets = await this.prisma.asset.findMany({
+      where: { symbol: { in: symbols } },
+      include: {
+        tokenContracts: {
+          where: { contractVerifiedAt: { not: null }, network: { mainnet: true } },
+          include: { network: true },
+        },
+      },
+    });
+    const assetBySymbol = new Map(assets.map((asset) => [asset.symbol, asset]));
+    const referenceTickers = await this.marketData.getTickers().catch((error) => {
+      this.logger.warn(
+        `Spot reference statistics unavailable: ${error instanceof Error ? error.message : 'unknown error'}`,
+      );
+      return [];
+    });
+    const referenceByBase = new Map(
+      referenceTickers.flatMap((ticker) => {
+        const symbol = String(ticker.symbol ?? '').toUpperCase();
+        if (!symbol.endsWith('-PERP')) return [];
+        return [[symbol.slice(0, -'-PERP'.length), ticker] as const];
+      }),
+    );
+    const networkKeys = [...new Set(pairs.map((pair) => pair.preferredNetwork))];
+    const pricesByNetwork = new Map<string, Record<string, string>>();
+    for (const networkKey of networkKeys) {
+      const chainId = ONEINCH_EVM_NETWORKS.get(networkKey);
+      if (!chainId) continue;
+      try {
+        const prices = await this.oneInch.getSpotPrices(chainId);
+        pricesByNetwork.set(
+          networkKey,
+          Object.fromEntries(Object.entries(prices).map(([address, price]) => [address.toLowerCase(), price])),
+        );
+      } catch (error) {
+        this.logger.warn(`1inch Spot prices unavailable on ${networkKey}: ${error instanceof Error ? error.message : 'unknown error'}`);
+      }
+    }
+
+    const time = Date.now();
+    const tickers: SpotTicker[] = [];
+    for (const pair of pairs) {
+      const prices = pricesByNetwork.get(pair.preferredNetwork);
+      const base = assetBySymbol.get(pair.baseAsset);
+      const quote = assetBySymbol.get(pair.quoteAsset);
+      if (!prices || !base || !quote) continue;
+      const baseContract = base.tokenContracts.find((item) => item.network.chainKey === pair.preferredNetwork);
+      const quoteContract = quote.tokenContracts.find((item) => item.network.chainKey === pair.preferredNetwork);
+      if (!baseContract || !quoteContract) continue;
+      const baseAddress = (baseContract.standard === TokenStandard.NATIVE
+        ? NATIVE_TOKEN_ADDRESS
+        : baseContract.address ?? '').toLowerCase();
+      const quoteAddress = (quoteContract.standard === TokenStandard.NATIVE
+        ? NATIVE_TOKEN_ADDRESS
+        : quoteContract.address ?? '').toLowerCase();
+      const basePrice = prices[baseAddress];
+      const quotePrice = prices[quoteAddress];
+      if (!basePrice || !quotePrice || new Prisma.Decimal(quotePrice).isZero()) continue;
+      const price = new Prisma.Decimal(basePrice).div(quotePrice);
+      if (!price.isPositive()) continue;
+      const lastPrice = this.formatSpotTickerPrice(price);
+      const referenceSymbol =
+        pair.baseAsset === 'WBTC' ? 'BTC' :
+        pair.baseAsset === 'WETH' ? 'ETH' :
+        pair.baseAsset;
+      const reference = referenceByBase.get(referenceSymbol);
+      const priceChangePct24h = this.optionalDecimalString(reference?.priceChangePct24h);
+      const volume24h = this.optionalNonNegativeDecimalString(reference?.volume24h);
+      const notional24h = this.optionalNonNegativeDecimalString(reference?.notional24h);
+      const priceChange24h = priceChangePct24h === null
+        ? null
+        : price.mul(priceChangePct24h).div(100).toDecimalPlaces(10).toString();
+      tickers.push({
+        symbol: pair.symbol,
+        provider: 'ONEINCH_SPOT_PRICE',
+        network: pair.preferredNetwork,
+        lastPrice,
+        markPrice: lastPrice,
+        priceChange24h,
+        priceChangePct24h,
+        volume24h,
+        notional24h,
+        statsProvider: reference ? 'HYPERLIQUID_PERP_REFERENCE' : null,
+        time,
+      });
+    }
+    return tickers;
+  }
+
+  private optionalDecimalString(value: unknown): string | null {
+    if (value === null || value === undefined || value === '') return null;
+    try {
+      const parsed = new Prisma.Decimal(String(value));
+      return parsed.isFinite() ? parsed.toString() : null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  private optionalNonNegativeDecimalString(value: unknown): string | null {
+    const parsed = this.optionalDecimalString(value);
+    return parsed !== null && new Prisma.Decimal(parsed).greaterThanOrEqualTo(0) ? parsed : null;
+  }
+
+  private spotNotional(value: string | null): Prisma.Decimal {
+    const parsed = this.optionalNonNegativeDecimalString(value);
+    return new Prisma.Decimal(parsed ?? 0);
+  }
+
+  private formatSpotTickerPrice(price: Prisma.Decimal): string {
+    if (price.greaterThanOrEqualTo(1000)) return price.toDecimalPlaces(2).toString();
+    if (price.greaterThanOrEqualTo(1)) return price.toDecimalPlaces(6).toString();
+    return price.toDecimalPlaces(10).toString();
+  }
+
   async getReadiness() {
+    const now = Date.now();
+    if (this.readinessCache && this.readinessCache.expiresAt > now) {
+      return this.readinessCache.value;
+    }
+    if (this.readinessRefresh) return this.readinessRefresh;
+
+    this.readinessRefresh = this.computeReadiness()
+      .then((value) => {
+        this.readinessCache = {
+          value,
+          expiresAt:
+            Date.now() + this.config.get<number>('CONVERT_READINESS_CACHE_MS', 120_000),
+        };
+        return value;
+      })
+      .finally(() => {
+        this.readinessRefresh = undefined;
+      });
+    return this.readinessRefresh;
+  }
+
+  private async computeReadiness() {
     const enabledEvmNetworks = this.evmNetworkPreference();
     const networks = await this.prisma.network.findMany({
       where: {
@@ -329,6 +711,7 @@ export class ConvertService {
       return created;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 
+    this.publishBalanceUpdate(conversion.userId);
     return this.presentConversion(conversion);
   }
 
@@ -419,9 +802,11 @@ export class ConvertService {
     ) {
       throw new ServiceUnavailableException('Stored 1inch network metadata is invalid');
     }
-    const walletAddress = await this.custody.getWalletAddress();
+    const spotWalletId = this.spotLiquidityWalletId();
+    const walletAddress = await this.custody.getWalletAddress(spotWalletId);
     if (conversion.txHash) {
       const receipt = await this.waitForEvmTransaction(conversion.txHash, conversion.networkKey);
+      this.assertEvmTransactionSender(receipt, walletAddress);
       await this.finalizeEvmOutput(conversion, walletAddress, data, receipt);
       return;
     }
@@ -449,12 +834,14 @@ export class ConvertService {
           data: approval.data,
           referenceId: `convert-approve:${conversion.id}`,
           chainId: data.chainId,
+          walletId: spotWalletId,
         });
         await this.prisma.conversion.update({
           where: { id: conversion.id },
           data: { approvalTxHash: sent.txHash },
         });
-        await this.waitForEvmTransaction(sent.txHash, conversion.networkKey);
+        const approvalReceipt = await this.waitForEvmTransaction(sent.txHash, conversion.networkKey);
+        this.assertEvmTransactionSender(approvalReceipt, walletAddress);
       }
     }
 
@@ -481,6 +868,7 @@ export class ConvertService {
       data: swap.tx.data,
       referenceId: `convert-swap:${conversion.id}`,
       chainId: data.chainId,
+      walletId: spotWalletId,
     });
     await this.prisma.conversion.update({
       where: { id: conversion.id },
@@ -491,6 +879,7 @@ export class ConvertService {
       },
     });
     const receipt = await this.waitForEvmTransaction(sent.txHash, conversion.networkKey);
+    this.assertEvmTransactionSender(receipt, walletAddress);
     await this.finalizeEvmOutput({
       ...conversion,
       txHash: sent.txHash,
@@ -540,10 +929,10 @@ export class ConvertService {
   }
 
   private async settleConversion(id: string, netAmount: Prisma.Decimal, feeOverride?: Prisma.Decimal) {
-    await this.prisma.$transaction(async (tx) => {
+    const userId = await this.prisma.$transaction(async (tx) => {
       const conversion = await tx.conversion.findUniqueOrThrow({ where: { id } });
       if (conversion.status === ConversionStatus.FILLED) {
-        return;
+        return conversion.userId;
       }
       const fee = feeOverride ?? new Prisma.Decimal(conversion.feeAmount);
       const gross = netAmount.plus(fee);
@@ -585,18 +974,20 @@ export class ConvertService {
           failureReason: null,
         },
       });
+      return conversion.userId;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    this.publishBalanceUpdate(userId);
   }
 
   private async failConversion(id: string, reason: string, release: boolean) {
-    await this.prisma.$transaction(async (tx) => {
+    const userId = await this.prisma.$transaction(async (tx) => {
       const conversion = await tx.conversion.findUnique({ where: { id } });
       if (
         !conversion ||
         conversion.status === ConversionStatus.FILLED ||
         conversion.status === ConversionStatus.CANCELLED
       ) {
-        return;
+        return conversion?.userId ?? null;
       }
       if (release) {
         await this.ledger.postTransaction({
@@ -626,7 +1017,13 @@ export class ConvertService {
         where: { id },
         data: { status: ConversionStatus.FAILED, failureReason: reason, completedAt: new Date() },
       });
+      return conversion.userId;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    if (userId) this.publishBalanceUpdate(userId);
+  }
+
+  private publishBalanceUpdate(userId: string): void {
+    this.userUpdates?.publish(userId, ['balances']);
   }
 
   private async quoteNativeReserve(
@@ -686,7 +1083,7 @@ export class ConvertService {
       );
     }
 
-    const wallet = await this.custody.getWalletAddress();
+    const wallet = await this.custody.getWalletAddress(this.spotLiquidityWalletId());
     const failures: string[] = [];
     for (const route of routes) {
       const fromRaw = parseUnits(amount.toFixed(route.fromDecimals), route.fromDecimals);
@@ -789,6 +1186,26 @@ export class ConvertService {
     );
   }
 
+  private spotLiquidityWalletId(): string {
+    return this.config.getOrThrow<string>('PRIVY_SPOT_LIQUIDITY_WALLET_ID');
+  }
+
+  private spotGasReserve(networkKey: string): Prisma.Decimal {
+    const defaults: Record<string, string> = {
+      ethereum: '0.02',
+      bnb: '0.02',
+      arbitrum: '0.005',
+      base: '0.005',
+      optimism: '0.005',
+    };
+    return new Prisma.Decimal(
+      this.config.get<string>(
+        `CONVERT_SPOT_GAS_RESERVE_${networkKey.toUpperCase()}`,
+        defaults[networkKey] ?? '0.005',
+      ),
+    );
+  }
+
   private evmNetworkPreference(): string[] {
     const configured = this.config.get<string>(
       'CONVERT_EVM_NETWORKS',
@@ -799,6 +1216,107 @@ export class ConvertService {
       .map((value) => value.trim().toLowerCase())
       .filter((value) => ONEINCH_EVM_NETWORKS.has(value));
     return [...new Set(selected)];
+  }
+
+  private spotCatalogNetworkPreference(): string[] {
+    const executable = new Set(this.evmNetworkPreference());
+    const configured = this.config.get<string>(
+      'CONVERT_SPOT_NETWORKS',
+      this.evmNetworkPreference().join(','),
+    ) ?? '';
+    return [...new Set(
+      configured
+        .split(',')
+        .map((value) => value.trim().toLowerCase())
+        .filter((value) => executable.has(value)),
+    )];
+  }
+
+  private async getSpotCatalogFundedQuotes(
+    preference: string[],
+  ): Promise<Map<string, Set<string>>> {
+    const key = preference.join(',');
+    if (
+      this.spotLiquidityCache &&
+      this.spotLiquidityCache.key === key &&
+      this.spotLiquidityCache.expiresAt > Date.now()
+    ) {
+      return this.spotLiquidityCache.value;
+    }
+    if (this.spotLiquidityRefresh) return this.spotLiquidityRefresh;
+
+    this.spotLiquidityRefresh = this.loadSpotCatalogFundedQuotes(preference)
+      .then((value) => {
+        this.spotLiquidityCache = {
+          key,
+          expiresAt: Date.now() + this.config.get<number>('CONVERT_SPOT_CATALOG_CACHE_MS', 60_000),
+          value,
+        };
+        return value;
+      })
+      .finally(() => {
+        this.spotLiquidityRefresh = undefined;
+      });
+    return this.spotLiquidityRefresh;
+  }
+
+  private async loadSpotCatalogFundedQuotes(
+    preference: string[],
+  ): Promise<Map<string, Set<string>>> {
+    const result = new Map<string, Set<string>>();
+    if (preference.length === 0) return result;
+    let wallet: string;
+    try {
+      wallet = await this.custody.getWalletAddress(this.spotLiquidityWalletId());
+    } catch (error) {
+      this.logger.warn(`Spot catalog liquidity check skipped: ${this.safeError(error)}`);
+      return result;
+    }
+    const stableAssets = await this.prisma.asset.findMany({
+      where: { symbol: { in: ['USDC', 'USDT'] } },
+      include: {
+        tokenContracts: {
+          where: {
+            standard: TokenStandard.ERC20,
+            contractVerifiedAt: { not: null },
+            network: { mainnet: true, chainKey: { in: preference } },
+          },
+          include: { network: true },
+        },
+      },
+    });
+    const minimumStable = new Prisma.Decimal(
+      this.config.get<string>('CONVERT_SPOT_CATALOG_MIN_STABLE_BALANCE', '100'),
+    );
+
+    await Promise.all(preference.map(async (networkKey) => {
+      try {
+        const expectedChainId = ONEINCH_EVM_NETWORKS.get(networkKey);
+        if (!expectedChainId || await this.rpc.getChainId(networkKey) !== expectedChainId) return;
+        const gas = await this.getEvmBalance(wallet, undefined, networkKey, 18);
+        if (gas.lessThan(this.spotGasReserve(networkKey))) return;
+        const funded = new Set<string>();
+        for (const asset of stableAssets) {
+          const contract = asset.tokenContracts.find(
+            (item) => item.network.chainKey === networkKey && item.address,
+          );
+          if (!contract?.address) continue;
+          const balance = await this.getEvmBalance(
+            wallet,
+            contract.address,
+            networkKey,
+            contract.decimals,
+          );
+          if (balance.greaterThanOrEqualTo(minimumStable)) funded.add(asset.symbol);
+        }
+        if (funded.size > 0) result.set(networkKey, funded);
+      } catch (error) {
+        this.logger.warn(
+          `Spot catalog excluded ${networkKey}: ${this.safeError(error)}`,
+        );
+      }
+    }));
+    return result;
   }
 
   private async loadAsset(symbol: string) {
@@ -817,7 +1335,7 @@ export class ConvertService {
     if (!data.fromToken || data.fromDecimals === undefined || !data.chainId || !data.networkKey) {
       throw new ServiceUnavailableException('EVM quote inventory metadata is missing');
     }
-    const wallet = await this.custody.getWalletAddress();
+    const wallet = await this.custody.getWalletAddress(this.spotLiquidityWalletId());
     await this.assertEvmRouteInventory({
       networkKey: data.networkKey,
       chainId: data.chainId,
@@ -925,6 +1443,20 @@ export class ConvertService {
       }
     }, 0n);
     return new Prisma.Decimal(formatUnits(raw, decimals));
+  }
+
+  private assertEvmTransactionSender(
+    transaction: { from?: string },
+    expectedWalletAddress: string,
+  ): void {
+    if (
+      !transaction.from ||
+      getAddress(transaction.from) !== getAddress(expectedWalletAddress)
+    ) {
+      throw new ManualReconciliationRequiredError(
+        'Confirmed conversion was signed by an unexpected custody wallet',
+      );
+    }
   }
 
   private async getAggregateEvmBalance(asset: any): Promise<Prisma.Decimal> {
@@ -1060,19 +1592,46 @@ export class ConvertService {
     try {
       const [chainId, walletAddress] = await Promise.all([
         this.rpc.getChainId(networkKey),
-        this.custody.getWalletAddress(),
+        this.custody.getWalletAddress(this.spotLiquidityWalletId()),
       ]);
       const providerConfigured = this.oneInch.getStatus().enabled;
+      const gasBalance = await this.getEvmBalance(walletAddress, undefined, networkKey, 18);
+      const usdc = await this.prisma.tokenContract.findFirst({
+        where: {
+          standard: TokenStandard.ERC20,
+          address: { not: null },
+          contractVerifiedAt: { not: null },
+          asset: { symbol: 'USDC' },
+          network: { chainKey: networkKey, mainnet: true },
+        },
+      });
+      const usdcBalance = usdc?.address
+        ? await this.getEvmBalance(walletAddress, usdc.address, networkKey, usdc.decimals)
+        : new Prisma.Decimal(0);
+      const minimumStable = new Prisma.Decimal(
+        this.config.get<string>('CONVERT_SPOT_CATALOG_MIN_STABLE_BALANCE', '100'),
+      );
+      const gasRequired = this.spotGasReserve(networkKey);
+      const liquidityReady = usdcBalance.greaterThanOrEqualTo(minimumStable) &&
+        gasBalance.greaterThanOrEqualTo(gasRequired);
       return {
-        ready: chainId === expectedChainId && Boolean(walletAddress) && providerConfigured,
+        ready: chainId === expectedChainId && Boolean(walletAddress) && providerConfigured && liquidityReady,
         chainId,
         custodyWalletConfigured: Boolean(walletAddress),
         providerConfigured,
+        liquidityReady,
+        usdcBalance: usdcBalance.toString(),
+        minimumUsdcBalance: minimumStable.toString(),
+        gasBalance: gasBalance.toString(),
+        minimumGasBalance: gasRequired.toString(),
+        reason: liquidityReady ? null : 'SPOT_LIQUIDITY_INSUFFICIENT',
       };
     } catch (error) {
       return {
         ready: false,
-        custodyWalletConfigured: this.custody.isEnabled(),
+        custodyWalletConfigured: Boolean(
+          this.config.get<string>('PRIVY_SPOT_LIQUIDITY_WALLET_ID'),
+        ),
         providerConfigured: this.oneInch.getStatus().enabled,
         reason: this.safeError(error),
       };
@@ -1107,6 +1666,12 @@ export class ConvertService {
       const tronModule = await import('tronweb');
       const TronWebCtor = (tronModule as any).TronWeb ?? (tronModule as any).default;
       const apiKey = this.config.get<string>('TRON_PRO_API_KEY', '').trim();
+      if (
+        this.config.get<string>('NODE_ENV', 'development') === 'production' &&
+        !apiKey
+      ) {
+        throw new ServiceUnavailableException('TRON_PRO_API_KEY is required in production');
+      }
       const tronWeb = new TronWebCtor({
         fullHost,
         ...(apiKey ? { headers: { 'TRON-PRO-API-KEY': apiKey } } : {}),

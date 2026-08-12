@@ -124,9 +124,7 @@ until the close order becomes `FILLED`; then refresh balances, positions and ord
 
 TP/SL is not part of the opening-order payload. After a position is filled,
 create separate reduce-only `STOP_LOSS` and/or `TAKE_PROFIT` orders with the
-opposite side, position size and `triggerPrice`. For A-book positions the size
-must equal the full open position. TP and SL are OCO siblings: when one triggers,
-the backend cancels the other before routing a market close to Hyperliquid.
+opposite side, position size and `triggerPrice`.
 
 ## 6. Realtime updates
 
@@ -137,9 +135,12 @@ io(`${API_URL}/private`, { auth: { token: accessToken } });
 ```
 
 Consume `orders`, `trades`, `positions`, `balances`, `portfolio`,
-`liquidations`, `provider_status` and `risk_alert`. The server emits a snapshot
-on connect and every 10 seconds. Emit `resync` immediately after create, cancel
-or close. Poll `/orders` and `/positions` every 5-10 seconds if the socket is disconnected.
+`liquidations_snapshot`, `liquidation`, `provider_status` and `risk_alert`.
+`liquidations_snapshot` is history/state and must never create a toast on its
+own. Only the singular `liquidation` occurrence event may create a toast. The
+server emits a fallback snapshot periodically. Emit `resync` immediately after
+create, cancel or close. Poll `/orders` and `/positions` every 5-10 seconds if
+the socket is disconnected.
 
 ## 7. Error rendering
 

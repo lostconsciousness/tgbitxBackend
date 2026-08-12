@@ -89,6 +89,57 @@ describe('OneInchSwapProviderService', () => {
     );
   });
 
+  it('loads bulk Spot prices from the price API with the same authentication', async () => {
+    const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee': '1000000000000000000',
+      }),
+    } as Response);
+    const service = new OneInchSwapProviderService(config({
+      ONEINCH_ENABLED: true,
+      ONEINCH_API_KEY: 'test-api-key',
+      ONEINCH_BASE_URL: 'https://api.1inch.com/swap/v6.1',
+      ONEINCH_CHAIN_ID: 42161,
+      ONEINCH_MIN_REQUEST_INTERVAL_MS: 0,
+    }));
+
+    await expect(service.getSpotPrices(42161)).resolves.toHaveProperty(
+      '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.objectContaining({ href: 'https://api.1inch.com/price/v1.1/42161' }),
+      expect.objectContaining({
+        headers: expect.objectContaining({ authorization: 'Bearer test-api-key' }),
+      }),
+    );
+  });
+
+  it('deduplicates and caches bulk Spot prices per chain', async () => {
+    const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({ '0xtoken': '1' }),
+    } as Response);
+    const service = new OneInchSwapProviderService(config({
+      ONEINCH_ENABLED: true,
+      ONEINCH_API_KEY: 'test-api-key',
+      ONEINCH_BASE_URL: 'https://api.1inch.com/swap/v6.1',
+      ONEINCH_CHAIN_ID: 42161,
+      ONEINCH_MIN_REQUEST_INTERVAL_MS: 0,
+      ONEINCH_PRICE_CACHE_MS: 5_000,
+    }));
+
+    const [first, second] = await Promise.all([
+      service.getSpotPrices(42161),
+      service.getSpotPrices(42161),
+    ]);
+    const third = await service.getSpotPrices(42161);
+
+    expect(first).toEqual(second);
+    expect(third).toEqual(first);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('requests exact approval calldata rather than unlimited allowance', async () => {
     const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue({
       ok: true,

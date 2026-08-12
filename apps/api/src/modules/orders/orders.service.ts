@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Injectable,
   NotFoundException,
+  Optional,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import {
@@ -29,9 +30,12 @@ import { MarketsService } from '../markets/markets.service';
 import { RoutingService } from '../routing/routing.service';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { OperationalSettingsService } from '../settings/operational-settings.service';
+import { UserUpdatesService } from '../user-updates/user-updates.service';
 
 @Injectable()
 export class OrdersService {
+  private providerExecutionQueue: Promise<void> = Promise.resolve();
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
@@ -41,6 +45,7 @@ export class OrdersService {
     private readonly ledger: LedgerService,
     private readonly hyperliquid: HyperliquidExecutionService,
     private readonly settings: OperationalSettingsService,
+    @Optional() private readonly userUpdates?: UserUpdatesService,
   ) {}
 
   listUserOrders(userId: string) {
@@ -52,12 +57,19 @@ export class OrdersService {
   }
 
   async getExecutionReadiness() {
-    const [tradingPaused, bbookPaused] = await Promise.all([
+    const [tradingPaused, aBookReconciliationPaused, bbookPaused, exposures] = await Promise.all([
       this.settings.getBoolean('trading:paused', 'TRADING_PAUSED', false),
+      this.settings.getBoolean('abook:reconciliation-paused', 'ABOOK_RECONCILIATION_PAUSED', false),
       this.settings.getBoolean('bbook:paused', 'BBOOK_PAUSED', false),
+      this.prisma.bBookExposure.findMany({
+        select: { netNotional: true, unrealizedPlatformPnl: true },
+      }),
     ]);
     const providerReadiness = await this.hyperliquid.getReadiness();
     const aBookReasons = [...providerReadiness.reasons];
+    if (aBookReconciliationPaused) {
+      aBookReasons.push('PROVIDER_POSITION_MISMATCH');
+    }
     if (providerReadiness.ready) {
       const marketDataChecks = await Promise.allSettled(
         ['BTC-PERP', 'ETH-PERP', 'SOL-PERP'].map((symbol) =>
@@ -77,11 +89,30 @@ export class OrdersService {
     const insuranceCapital = new Prisma.Decimal(
       this.config.get<string>('INSURANCE_CAPITAL_USDC', '0'),
     );
+    const minimumCapital = new Prisma.Decimal(
+      this.config.get<string>('BBOOK_MIN_PLATFORM_CAPITAL_USDC', '500'),
+    );
+    const minimumInsurance = new Prisma.Decimal(
+      this.config.get<string>('BBOOK_MIN_INSURANCE_CAPITAL_USDC', '100'),
+    );
     const bBookReady = Boolean(
       this.config.get<boolean>('BBOOK_ENABLED', false) &&
       !bbookPaused &&
-      platformCapital.greaterThan(0) &&
-      insuranceCapital.greaterThan(0)
+      platformCapital.greaterThanOrEqualTo(minimumCapital) &&
+      insuranceCapital.greaterThanOrEqualTo(minimumInsurance)
+    );
+    const bBookReasons: string[] = [];
+    if (!this.config.get<boolean>('BBOOK_ENABLED', false)) bBookReasons.push('BBOOK_DISABLED');
+    if (bbookPaused) bBookReasons.push('BBOOK_PAUSED');
+    if (platformCapital.lessThan(minimumCapital)) bBookReasons.push('PLATFORM_CAPITAL_INSUFFICIENT');
+    if (insuranceCapital.lessThan(minimumInsurance)) bBookReasons.push('INSURANCE_CAPITAL_INSUFFICIENT');
+    const totalNetExposure = exposures.reduce(
+      (sum, exposure) => sum.plus(new Prisma.Decimal(exposure.netNotional).abs()),
+      new Prisma.Decimal(0),
+    );
+    const unrealizedPlatformPnl = exposures.reduce(
+      (sum, exposure) => sum.plus(exposure.unrealizedPlatformPnl),
+      new Prisma.Decimal(0),
     );
     return {
       ready: !tradingPaused && (aBookReady || bBookReady),
@@ -94,14 +125,25 @@ export class OrdersService {
           provider: 'HYPERLIQUID',
           reasons: aBookReasons,
           accountValue: providerReadiness.accountValue ?? null,
+          withdrawable: providerReadiness.withdrawable ?? null,
           agentRegistered: providerReadiness.agentRegistered,
         },
         bBook: {
           ready: bBookReady,
+          funded: platformCapital.greaterThanOrEqualTo(minimumCapital) &&
+            insuranceCapital.greaterThanOrEqualTo(minimumInsurance),
           enabled: this.config.get<boolean>('BBOOK_ENABLED', false),
           paused: bbookPaused,
           capitalConfigured: platformCapital.greaterThan(0),
           insuranceConfigured: insuranceCapital.greaterThan(0),
+          capital: platformCapital.toString(),
+          insurance: insuranceCapital.toString(),
+          minimumCapital: minimumCapital.toString(),
+          minimumInsurance: minimumInsurance.toString(),
+          availableRiskCapital: Prisma.Decimal.max(0, platformCapital.plus(unrealizedPlatformPnl)).toString(),
+          totalNetExposure: totalNetExposure.toString(),
+          unrealizedPlatformPnl: unrealizedPlatformPnl.toString(),
+          reasons: bBookReasons,
         },
       },
     };
@@ -136,7 +178,9 @@ export class OrdersService {
       throw new BadRequestException('Market is not active');
     }
     if (market.type === MarketType.SPOT) {
-      return this.createSpotOrder(userId, dto, market, size);
+      const spotOrder = await this.createSpotOrder(userId, dto, market, size);
+      this.publishTradingUpdate(userId);
+      return spotOrder;
     }
     if (market.type !== MarketType.PERP || market.status !== MarketStatus.ACTIVE) {
       throw new BadRequestException('Perpetual market is not active');
@@ -172,6 +216,29 @@ export class OrdersService {
           where: { userId, marketId: market.id, status: PositionStatus.OPEN },
         })
       : null;
+    if (dto.reduceOnly && dto.type === OrderType.MARKET && existingPosition) {
+      const activeClose = await this.prisma.order.findFirst({
+        where: {
+          userId,
+          marketId: market.id,
+          reduceOnly: true,
+          type: OrderType.MARKET,
+          status: {
+            in: [
+              OrderStatus.ROUTED,
+              OrderStatus.OPEN,
+              OrderStatus.PARTIALLY_FILLED,
+              OrderStatus.PROVIDER_PENDING,
+            ],
+          },
+        },
+        include: { market: true, providerOrder: true, trades: true },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (activeClose) {
+        return activeClose;
+      }
+    }
     if (dto.type === OrderType.STOP_LOSS || dto.type === OrderType.TAKE_PROFIT) {
       return this.createPerpTriggerOrder(userId, dto, market, size, existingPosition, mark);
     }
@@ -197,18 +264,33 @@ export class OrdersService {
         message: `Maximum perpetual order notional is ${maxNotional.toString()} USDC`,
       });
     }
-    const route =
+    const ticker = await this.marketData.getTicker(market.symbol);
+    let route =
       existingPosition?.route ??
       (await this.routing.decide({
         marketId: market.id,
         notional,
         platformMarkAgeMs: markAgeMs,
+        side: dto.side,
+        book,
+        notional24h: new Prisma.Decimal(ticker.notional24h),
+        referenceMark: new Prisma.Decimal(ticker.markPrice ?? mark),
       }));
     if (route === ExecutionRoute.A_BOOK_HYPERLIQUID) {
-      const readiness = await this.hyperliquid.getReadiness();
+      const [readiness, reconciliationPaused] = await Promise.all([
+        this.hyperliquid.getReadiness(),
+        this.settings.getBoolean(
+          'abook:reconciliation-paused',
+          'ABOOK_RECONCILIATION_PAUSED',
+          false,
+        ),
+      ]);
       const blockingReasons = dto.reduceOnly
         ? readiness.reasons.filter((reason) => reason !== 'COLLATERAL_INSUFFICIENT')
         : readiness.reasons;
+      if (reconciliationPaused && !dto.reduceOnly) {
+        blockingReasons.push('PROVIDER_POSITION_MISMATCH');
+      }
       if (book.provider !== 'HYPERLIQUID') {
         blockingReasons.push('MARKET_DATA_NOT_HYPERLIQUID');
       }
@@ -226,10 +308,28 @@ export class OrdersService {
         });
       }
     }
+    const executionPrice = route === ExecutionRoute.B_BOOK_INTERNAL
+      ? this.calculateBookVwap(book, dto.side, size)
+      : mark;
+    const executionNotional = size.mul(executionPrice);
     const margin = dto.reduceOnly ? new Prisma.Decimal(0) : notional.div(leverage);
-    const fee = notional.mul((await this.getFeeConfig(market.id)).takerFeeBps).div(10_000);
+    const fee = executionNotional
+      .mul((await this.getFeeConfig(market.id)).takerFeeBps)
+      .div(10_000);
 
     const order = await this.prisma.$transaction(async (tx) => {
+      if (route === ExecutionRoute.B_BOOK_INTERNAL) {
+        await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(742662001)');
+        route = await this.routing.decide({
+          marketId: market.id,
+          notional,
+          platformMarkAgeMs: Math.max(0, Date.now() - book.time),
+          side: dto.side,
+          book,
+          notional24h: new Prisma.Decimal(ticker.notional24h),
+          referenceMark: new Prisma.Decimal(ticker.markPrice ?? mark),
+        }, tx);
+      }
       if (!dto.reduceOnly) {
         await this.ledger.assertSufficientUserSpotBalance({
           userId,
@@ -298,7 +398,7 @@ export class OrdersService {
           side: dto.side,
           route,
           size,
-          price: mark,
+          price: executionPrice,
           margin,
           leverage,
           fee,
@@ -315,7 +415,8 @@ export class OrdersService {
       isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
     });
 
-    if (route === ExecutionRoute.B_BOOK_INTERNAL) {
+    if (order.route === ExecutionRoute.B_BOOK_INTERNAL) {
+      this.publishTradingUpdate(userId);
       return order;
     }
     return this.placeAbookOrder(order.id, mark, settlement);
@@ -361,12 +462,14 @@ export class OrdersService {
           error instanceof Error ? error.message : 'Provider cancellation result is ambiguous',
         );
       }
-      return this.prisma.order.findUniqueOrThrow({
+      const result = await this.prisma.order.findUniqueOrThrow({
         where: { id: order.id },
         include: { market: true, providerOrder: true, trades: true },
       });
+      this.publishTradingUpdate(userId);
+      return result;
     }
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       if (order.market.type === MarketType.SPOT) {
         await this.releaseSpotReserve(tx, order);
       } else {
@@ -384,6 +487,8 @@ export class OrdersService {
         include: { market: true, providerOrder: true },
       });
     });
+    this.publishTradingUpdate(userId);
+    return result;
   }
 
   async matchOpenSpotOrders(limit = 50) {
@@ -405,6 +510,7 @@ export class OrdersService {
     for (const order of orders) {
       try {
         const book = await this.marketData.getOrderBook(order.market.symbol);
+        this.assertSpotExecutionBook(book.provider);
         const bestBid = book.bids[0];
         const bestAsk = book.asks[0];
         if (!bestBid || !bestAsk || !order.price) {
@@ -425,6 +531,7 @@ export class OrdersService {
         const filled = await this.fillOpenSpotLimitOrder(order.id, executionPrice);
         if (filled) {
           matched.push(filled);
+          this.publishTradingUpdate(filled.userId);
         }
       } catch (_error) {
         continue;
@@ -757,6 +864,8 @@ export class OrdersService {
 
     const feeConfig = await this.getFeeConfig(market.id);
     const limitPrice = dto.price ? new Prisma.Decimal(dto.price) : null;
+    const book = await this.marketData.getOrderBook(market.symbol);
+    this.assertSpotExecutionBook(book.provider);
     if (dto.type === OrderType.LIMIT) {
       return this.prisma.$transaction(async (tx) => {
         const notional = size.mul(limitPrice!);
@@ -810,7 +919,6 @@ export class OrdersService {
       });
     }
 
-    const book = await this.marketData.getOrderBook(market.symbol);
     const bestBid = book.bids[0];
     const bestAsk = book.asks[0];
     const executionLevel = dto.side === OrderSide.BUY ? bestAsk : bestBid;
@@ -1314,7 +1422,22 @@ export class OrdersService {
       liquidationInsuranceFee: Prisma.Decimal;
     },
   ) {
-    const order = await this.prisma.order.findUniqueOrThrow({
+    return this.withProviderExecutionLock(() =>
+      this.placeAbookOrderLocked(orderId, mark, _settlement),
+    );
+  }
+
+  private async placeAbookOrderLocked(
+    orderId: string,
+    mark: Prisma.Decimal,
+    _settlement?: {
+      liquidationEventId: string;
+      liquidationFee: Prisma.Decimal;
+      liquidationPlatformFee: Prisma.Decimal;
+      liquidationInsuranceFee: Prisma.Decimal;
+    },
+  ) {
+    let order = await this.prisma.order.findUniqueOrThrow({
       where: { id: orderId },
       include: { market: true },
     });
@@ -1322,6 +1445,21 @@ export class OrdersService {
       await this.failAndRelease(order, 'Hyperliquid execution is disabled');
       throw new ServiceUnavailableException('Hyperliquid execution is disabled');
     }
+    const providerSymbol = order.market.providerSymbol;
+    const coverage = order.reduceOnly
+      ? await this.applyExistingProviderHedgeCoverage(order, mark, _settlement)
+      : { remaining: new Prisma.Decimal(order.size), providerPosition: new Prisma.Decimal(0) };
+    if (coverage.remaining.isZero()) {
+      this.publishTradingUpdate(order.userId);
+      return this.prisma.order.findUniqueOrThrow({
+        where: { id: order.id },
+        include: { market: true, providerOrder: true, trades: true },
+      });
+    }
+    order = await this.prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: { market: true },
+    });
     const cloid = this.makeCloid(order.id);
     await this.prisma.$transaction(async (tx) => {
       await tx.providerOrder.create({
@@ -1342,19 +1480,24 @@ export class OrdersService {
         order.price ??
         (order.side === OrderSide.BUY ? mark.mul('1.01') : mark.mul('0.99'));
       const result = await this.hyperliquid.placeOrder({
-        providerSymbol: order.market.providerSymbol,
+        providerSymbol,
         cloid,
         side: order.side,
         type:
           order.type === OrderType.STOP_LOSS || order.type === OrderType.TAKE_PROFIT
             ? OrderType.MARKET
             : order.type,
-        size: order.size.toString(),
+        size: coverage.remaining.toString(),
         price: executionPrice.toDecimalPlaces(order.market.pricePrecision).toString(),
         triggerPrice: order.triggerPrice?.toString(),
-        // Provider order is an omnibus hedge delta. User reduce-only semantics
-        // are enforced against the internal position before routing.
-        reduceOnly: false,
+        // A customer close can increase the omnibus net position. Only mark the
+        // provider order reduce-only when this residual actually reduces the
+        // current Hyperliquid master position without crossing through zero.
+        reduceOnly: order.reduceOnly && this.providerDeltaIsReduceOnly(
+          coverage.providerPosition,
+          order.side,
+          coverage.remaining,
+        ),
       });
       await this.prisma.providerOrder.update({
         where: { orderId: order.id },
@@ -1372,24 +1515,14 @@ export class OrdersService {
         },
       });
       if (result.status === 'REJECTED') {
-        await this.releaseUnfilledProviderMargin({ ...order, filledSize: new Prisma.Decimal(0) });
-        await this.prisma.$transaction(async (tx) => {
-          await tx.providerOrder.update({
-            where: { orderId: order.id },
-            data: {
-              status: ProviderOrderStatus.FAILED,
-              failureReason: result.reason ?? 'Provider rejected order',
-              nextSyncAt: null,
-            },
-          });
-          await tx.order.update({
-            where: { id: order.id },
-            data: {
-              status: OrderStatus.FAILED,
-              rejectionReason: result.reason ?? 'Provider rejected order',
-            },
-          });
+        const currentOrder = await this.prisma.order.findUniqueOrThrow({
+          where: { id: order.id },
+          include: { market: true },
         });
+        await this.finalizeProviderRejection(
+          currentOrder,
+          result.reason ?? 'Provider rejected order',
+        );
         return this.prisma.order.findUniqueOrThrow({
           where: { id: order.id },
           include: { market: true, providerOrder: true, trades: true },
@@ -1401,12 +1534,27 @@ export class OrdersService {
         include: { market: true, providerOrder: true, trades: true },
       });
     } catch (error) {
+      const reason = error instanceof Error ? error.message : 'Provider request failed';
+      if (this.isTerminalProviderRejection(reason)) {
+        const currentOrder = await this.prisma.order.findUniqueOrThrow({
+          where: { id: order.id },
+          include: { market: true },
+        });
+        await this.finalizeProviderRejection(
+          currentOrder,
+          reason,
+        );
+        return this.prisma.order.findUniqueOrThrow({
+          where: { id: order.id },
+          include: { market: true, providerOrder: true, trades: true },
+        });
+      }
       await this.prisma.$transaction(async (tx) => {
         await tx.providerOrder.updateMany({
           where: { orderId: order.id },
           data: {
             status: ProviderOrderStatus.PENDING,
-            failureReason: error instanceof Error ? error.message.slice(0, 500) : 'Provider request failed',
+            failureReason: reason.slice(0, 500),
             nextSyncAt: new Date(Date.now() + 5_000),
             syncAttempts: { increment: 1 },
           },
@@ -1423,6 +1571,150 @@ export class OrdersService {
     }
   }
 
+  private async withProviderExecutionLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.providerExecutionQueue;
+    let release!: () => void;
+    this.providerExecutionQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  private async applyExistingProviderHedgeCoverage(
+    order: {
+      id: string;
+      userId: string;
+      marketId: string;
+      side: OrderSide;
+      size: Prisma.Decimal;
+      filledSize: Prisma.Decimal;
+      feeAmount: Prisma.Decimal;
+      leverage: number;
+      reduceOnly: boolean;
+      market: { providerSymbol: string | null; quoteAssetId: string };
+    },
+    price: Prisma.Decimal,
+    settlement?: {
+      liquidationEventId: string;
+      liquidationFee: Prisma.Decimal;
+      liquidationPlatformFee: Prisma.Decimal;
+      liquidationInsuranceFee: Prisma.Decimal;
+    },
+  ): Promise<{ remaining: Prisma.Decimal; providerPosition: Prisma.Decimal }> {
+    if (!order.market.providerSymbol) {
+      return { remaining: new Prisma.Decimal(order.size), providerPosition: new Prisma.Decimal(0) };
+    }
+    let providerPosition = new Prisma.Decimal(0);
+    try {
+      const state = await this.hyperliquid.getAccountState() as {
+        assetPositions?: Array<{ position?: { coin?: string; szi?: string } }>;
+      };
+      const providerAsset = state.assetPositions?.find(
+        (asset) => asset.position?.coin === order.market.providerSymbol,
+      );
+      providerPosition = new Prisma.Decimal(providerAsset?.position?.szi ?? 0);
+    } catch (_error) {
+      return { remaining: new Prisma.Decimal(order.size), providerPosition };
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(742662002)');
+      const currentOrder = await tx.order.findUniqueOrThrow({ where: { id: order.id } });
+      const remaining = new Prisma.Decimal(currentOrder.size).minus(currentOrder.filledSize);
+      if (!currentOrder.reduceOnly || remaining.lessThanOrEqualTo(0)) {
+        return { remaining: Prisma.Decimal.max(0, remaining), providerPosition };
+      }
+      const positions = await tx.position.findMany({
+        where: {
+          marketId: currentOrder.marketId,
+          route: ExecutionRoute.A_BOOK_HYPERLIQUID,
+          status: PositionStatus.OPEN,
+        },
+        select: { side: true, size: true },
+      });
+      const internalPosition = positions.reduce(
+        (sum, position) => sum.plus(
+          position.side === PositionSide.LONG ? position.size : position.size.negated(),
+        ),
+        new Prisma.Decimal(0),
+      );
+      const signedRemaining = currentOrder.side === OrderSide.BUY
+        ? remaining
+        : remaining.negated();
+      const currentGap = providerPosition.minus(internalPosition);
+      const gapAfterFullInternalFill = currentGap.minus(signedRemaining);
+      let covered = new Prisma.Decimal(0);
+      if (gapAfterFullInternalFill.abs().lessThanOrEqualTo(currentGap.abs())) {
+        covered = remaining;
+      } else if (currentGap.mul(signedRemaining).greaterThan(0)) {
+        covered = Prisma.Decimal.min(currentGap.abs(), remaining);
+      }
+      if (settlement && covered.lessThan(remaining)) {
+        covered = new Prisma.Decimal(0);
+      }
+      if (covered.lessThanOrEqualTo(0)) {
+        return { remaining, providerPosition };
+      }
+      const risk = await tx.riskConfig.findUniqueOrThrow({
+        where: { marketId: currentOrder.marketId },
+      });
+      const ratio = covered.div(currentOrder.size);
+      await this.applyFill(tx, {
+        orderId: currentOrder.id,
+        userId: currentOrder.userId,
+        marketId: currentOrder.marketId,
+        quoteAssetId: order.market.quoteAssetId,
+        side: currentOrder.side,
+        route: ExecutionRoute.A_BOOK_HYPERLIQUID,
+        size: covered,
+        price,
+        margin: new Prisma.Decimal(0),
+        leverage: currentOrder.leverage,
+        fee: new Prisma.Decimal(currentOrder.feeAmount).mul(ratio),
+        maintenanceRate: risk.maintenanceMarginRate,
+        reduceOnly: true,
+        providerFillId: `internal-net:${currentOrder.id}`,
+        settlement: settlement ? {
+          liquidationEventId: settlement.liquidationEventId,
+          liquidationFee: settlement.liquidationFee.mul(ratio),
+          liquidationPlatformFee: settlement.liquidationPlatformFee.mul(ratio),
+          liquidationInsuranceFee: settlement.liquidationInsuranceFee.mul(ratio),
+        } : undefined,
+      });
+      const signedCovered = currentOrder.side === OrderSide.BUY
+        ? covered
+        : covered.negated();
+      const nextProviderResidual = providerPosition.minus(
+        internalPosition.plus(signedCovered),
+      );
+      await tx.systemSetting.upsert({
+        where: {
+          key: `abook:provider-position-offset:${order.market.providerSymbol}`,
+        },
+        create: {
+          key: `abook:provider-position-offset:${order.market.providerSymbol}`,
+          value: nextProviderResidual.toString(),
+        },
+        update: { value: nextProviderResidual.toString() },
+      });
+      return { remaining: remaining.minus(covered), providerPosition };
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+  }
+
+  private providerDeltaIsReduceOnly(
+    providerPosition: Prisma.Decimal,
+    side: OrderSide,
+    size: Prisma.Decimal,
+  ): boolean {
+    const delta = side === OrderSide.BUY ? size : size.negated();
+    return providerPosition.mul(delta).lessThan(0) && size.lessThanOrEqualTo(providerPosition.abs());
+  }
+
   async reconcilePendingProviderOrders(limit = 20): Promise<number> {
     if (!this.hyperliquid.isExecutionEnabled()) {
       return 0;
@@ -1435,6 +1727,7 @@ export class OrdersService {
             ProviderOrderStatus.PENDING,
             ProviderOrderStatus.OPEN,
             ProviderOrderStatus.PARTIALLY_FILLED,
+            ProviderOrderStatus.RECONCILIATION_REQUIRED,
           ],
         },
         OR: [{ nextSyncAt: null }, { nextSyncAt: { lte: new Date() } }],
@@ -1458,11 +1751,26 @@ export class OrdersService {
     }
     if (
       (providerOrder.status === ProviderOrderStatus.FILLED &&
-        providerOrder.order.status === OrderStatus.FILLED) ||
+        (providerOrder.order.status === OrderStatus.FILLED ||
+          providerOrder.order.status === OrderStatus.CANCELLED)) ||
       providerOrder.status === ProviderOrderStatus.CANCELLED ||
       providerOrder.status === ProviderOrderStatus.FAILED
     ) {
       return providerOrder.order;
+    }
+    if (
+      !providerOrder.providerOrderId &&
+      providerOrder.failureReason &&
+      this.isTerminalProviderRejection(providerOrder.failureReason)
+    ) {
+      await this.finalizeProviderRejection(
+        providerOrder.order,
+        providerOrder.failureReason,
+      );
+      return this.prisma.order.findUniqueOrThrow({
+        where: { id: orderId },
+        include: { market: true, providerOrder: true, trades: true },
+      });
     }
     try {
       const [snapshot, fills] = await Promise.all([
@@ -1522,7 +1830,30 @@ export class OrdersService {
           await tx.order.update({ where: { id: orderId }, data: { status: OrderStatus.FILLED } });
         });
       } else if (snapshot.status === 'FILLED') {
-        await this.scheduleProviderRetry(providerOrder, 'Provider reports filled but fills are incomplete');
+        await this.releaseUnfilledProviderMargin(providerOrder.order);
+        await this.prisma.$transaction(async (tx) => {
+          await tx.providerOrder.update({
+            where: { id: providerOrder.id },
+            data: {
+              providerOrderId: snapshot.providerOrderId,
+              status: ProviderOrderStatus.FILLED,
+              rawResponse: this.toJson(snapshot.raw),
+              lastSyncedAt: now,
+              nextSyncAt: null,
+              syncAttempts: 0,
+              failureReason: 'IOC remainder cancelled after terminal partial fill',
+              reconciliationRequiredAt: null,
+            },
+          });
+          await tx.order.update({
+            where: { id: orderId },
+            data: {
+              status: OrderStatus.CANCELLED,
+              rejectionReason: 'Partially filled; unfilled IOC remainder cancelled',
+            },
+          });
+        });
+        this.publishTradingUpdate(providerOrder.order.userId);
       } else {
         await this.releaseUnfilledProviderMargin(providerOrder.order);
         await this.prisma.$transaction(async (tx) => {
@@ -1553,12 +1884,91 @@ export class OrdersService {
         include: { market: true, providerOrder: true, trades: true },
       });
     } catch (error) {
+      const reason = error instanceof Error ? error.message : 'Provider reconciliation failed';
+      if (await this.tryTerminalizeSupersededReduceOnlyOrder(providerOrder, reason)) {
+        return this.prisma.order.findUniqueOrThrow({
+          where: { id: orderId },
+          include: { market: true, providerOrder: true, trades: true },
+        });
+      }
       await this.scheduleProviderRetry(
         providerOrder,
-        error instanceof Error ? error.message : 'Provider reconciliation failed',
+        reason,
       );
       throw error;
     }
+  }
+
+  private async tryTerminalizeSupersededReduceOnlyOrder(
+    providerOrder: Prisma.ProviderOrderGetPayload<{
+      include: { order: { include: { market: true; liquidationEvent: true } } };
+    }>,
+    reason: string,
+  ): Promise<boolean> {
+    const order = providerOrder.order;
+    if (
+      !order.reduceOnly ||
+      !order.route ||
+      !providerOrder.providerOrderId ||
+      reason !== 'Reduce-only size exceeds open position'
+    ) {
+      return false;
+    }
+    const [openPosition, replacementTrade] = await Promise.all([
+      this.prisma.position.findFirst({
+        where: {
+          userId: order.userId,
+          marketId: order.marketId,
+          route: order.route,
+          status: PositionStatus.OPEN,
+        },
+        select: { id: true },
+      }),
+      this.prisma.trade.findFirst({
+        where: {
+          userId: order.userId,
+          marketId: order.marketId,
+          side: order.side,
+          size: order.size,
+          providerFillId: { startsWith: 'internal-net:' },
+          order: {
+            id: { not: order.id },
+            reduceOnly: true,
+            status: OrderStatus.FILLED,
+            createdAt: { gt: order.createdAt },
+          },
+        },
+        select: { orderId: true },
+        orderBy: { executedAt: 'asc' },
+      }),
+    ]);
+    if (openPosition || !replacementTrade) {
+      return false;
+    }
+    const explanation =
+      `Provider fill accounted by replacement close order ${replacementTrade.orderId}`;
+    await this.prisma.$transaction(async (tx) => {
+      await tx.providerOrder.update({
+        where: { id: providerOrder.id },
+        data: {
+          status: ProviderOrderStatus.FILLED,
+          lastSyncedAt: new Date(),
+          nextSyncAt: null,
+          syncAttempts: 0,
+          failureReason: explanation,
+          reconciliationRequiredAt: null,
+        },
+      });
+      await tx.order.update({
+        where: { id: order.id },
+        data: {
+          status: OrderStatus.CANCELLED,
+          rejectionReason: explanation,
+        },
+      });
+    });
+    this.publishTradingUpdate(order.userId);
+    return true;
   }
 
   private async applyProviderFill(
@@ -1573,9 +1983,9 @@ export class OrdersService {
       raw: unknown;
     },
   ): Promise<void> {
-    await this.prisma.$transaction(async (tx) => {
+    const updatedUserId = await this.prisma.$transaction(async (tx) => {
       if (await tx.providerFill.findUnique({ where: { providerFillId: fill.providerFillId } })) {
-        return;
+        return null;
       }
       const provider = await tx.providerOrder.findUniqueOrThrow({
         where: { orderId },
@@ -1623,7 +2033,69 @@ export class OrdersService {
           liquidationInsuranceFee: new Prisma.Decimal(liquidation.insuranceFee).mul(ratio),
         } : undefined,
       });
+      return order.userId;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    if (updatedUserId) this.publishTradingUpdate(updatedUserId);
+  }
+
+  private publishTradingUpdate(userId: string): void {
+    this.userUpdates?.publish(userId, ['balances', 'orders', 'positions', 'trades']);
+  }
+
+  private assertSpotExecutionBook(provider: string): void {
+    if (
+      this.config.get<string>('MARKET_DATA_PROVIDER', 'MOCK') === 'HYPERLIQUID' &&
+      provider !== 'HYPERLIQUID'
+    ) {
+      throw new ServiceUnavailableException({
+        code: 'SPOT_EXECUTION_UNAVAILABLE',
+        message: 'Spot order book is not connected to a production provider',
+      });
+    }
+  }
+
+  private isTerminalProviderRejection(reason: string): boolean {
+    return /insufficient margin|invalid order|order size|minimum.*(?:size|notional)|maximum.*(?:size|notional)|reduce.?only|would immediately trigger|price.*(?:invalid|out of bounds)|asset.*(?:invalid|unavailable)/i.test(
+      reason,
+    );
+  }
+
+  private async finalizeProviderRejection(
+    order: {
+      id: string;
+      userId: string;
+      size: Prisma.Decimal;
+      filledSize: Prisma.Decimal;
+      marginReserved: Prisma.Decimal;
+      market: { quoteAssetId: string };
+    },
+    reason: string,
+  ): Promise<void> {
+    const safeReason = reason.slice(0, 500);
+    await this.releaseUnfilledProviderMargin(order);
+    const partiallyFilled = new Prisma.Decimal(order.filledSize).greaterThan(0);
+    await this.prisma.$transaction(async (tx) => {
+      await tx.providerOrder.updateMany({
+        where: { orderId: order.id },
+        data: {
+          status: ProviderOrderStatus.FAILED,
+          failureReason: safeReason,
+          lastSyncedAt: new Date(),
+          nextSyncAt: null,
+          reconciliationRequiredAt: null,
+        },
+      });
+      await tx.order.update({
+        where: { id: order.id },
+        data: {
+          status: partiallyFilled ? OrderStatus.CANCELLED : OrderStatus.FAILED,
+          rejectionReason: partiallyFilled
+            ? `Partially filled; provider remainder rejected: ${safeReason}`.slice(0, 500)
+            : safeReason,
+        },
+      });
+    });
+    this.publishTradingUpdate(order.userId);
   }
 
   private async scheduleProviderRetry(
@@ -1635,6 +2107,10 @@ export class OrdersService {
     const graceMs = this.config.get<number>('PROVIDER_RECONCILIATION_UNKNOWN_GRACE_MS', 300_000);
     const requiresManual = attempts >= maxAttempts &&
       Date.now() - providerOrder.createdAt.getTime() >= graceMs;
+    const manualRecheckMs = this.config.get<number>(
+      'PROVIDER_RECONCILIATION_MANUAL_RECHECK_MS',
+      300_000,
+    );
     await this.prisma.providerOrder.update({
       where: { id: providerOrder.id },
       data: {
@@ -1643,9 +2119,12 @@ export class OrdersService {
           : ProviderOrderStatus.PENDING,
         syncAttempts: attempts,
         lastSyncedAt: new Date(),
-        nextSyncAt: requiresManual
-          ? null
-          : new Date(Date.now() + Math.min(60_000, 2_000 * 2 ** Math.min(attempts, 5))),
+        nextSyncAt: new Date(
+          Date.now() +
+            (requiresManual
+              ? manualRecheckMs
+              : Math.min(60_000, 2_000 * 2 ** Math.min(attempts, 5))),
+        ),
         failureReason: reason.slice(0, 500),
         reconciliationRequiredAt: requiresManual ? new Date() : undefined,
       },
@@ -2180,6 +2659,30 @@ export class OrdersService {
     return side === PositionSide.LONG
       ? entry.mul(new Prisma.Decimal(1).minus(initialMarginRate).plus(maintenanceRate))
       : entry.mul(new Prisma.Decimal(1).plus(initialMarginRate).minus(maintenanceRate));
+  }
+
+  private calculateBookVwap(
+    book: { bids: Array<{ price: string; size: string }>; asks: Array<{ price: string; size: string }> },
+    side: OrderSide,
+    requestedSize: Prisma.Decimal,
+  ): Prisma.Decimal {
+    const levels = side === OrderSide.BUY ? book.asks : book.bids;
+    let remaining = requestedSize;
+    let quote = new Prisma.Decimal(0);
+    for (const level of levels) {
+      if (remaining.lessThanOrEqualTo(0)) break;
+      const levelSize = new Prisma.Decimal(level.size);
+      const used = Prisma.Decimal.min(remaining, levelSize);
+      quote = quote.plus(used.mul(level.price));
+      remaining = remaining.minus(used);
+    }
+    if (remaining.greaterThan(0)) {
+      throw new ServiceUnavailableException({
+        code: 'BBOOK_DEPTH_INSUFFICIENT',
+        message: 'Market depth is insufficient for internal execution',
+      });
+    }
+    return quote.div(requestedSize);
   }
 
   private makeCloid(orderId: string): `0x${string}` {

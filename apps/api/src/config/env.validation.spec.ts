@@ -39,6 +39,55 @@ describe('envValidationSchema', () => {
     expect(result.error).toBeDefined();
   });
 
+  it('requires a signing key when Alchemy address activity is enabled', () => {
+    const result = envValidationSchema.validate({
+      ...baseEnv,
+      ALCHEMY_ADDRESS_ACTIVITY_ENABLED: true,
+    });
+
+    expect(result.error).toBeDefined();
+  });
+
+  it('accepts a per-webhook Alchemy signing key map', () => {
+    const result = envValidationSchema.validate({
+      ...baseEnv,
+      ALCHEMY_ADDRESS_ACTIVITY_ENABLED: true,
+      ALCHEMY_WEBHOOK_SIGNING_KEYS_JSON: JSON.stringify({ wh_arbitrum: 'secret' }),
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.value.DEPOSIT_EVM_FALLBACK_SCAN_MS).toBe(300_000);
+    expect(result.value.DEPOSIT_EVM_BALANCE_RECONCILE_ENABLED).toBe(false);
+  });
+
+  it('requires webhook management credentials for event-driven deposits in production', () => {
+    const result = envValidationSchema.validate({
+      ...baseEnv,
+      NODE_ENV: 'production',
+      MARKET_DATA_PROVIDER: 'HYPERLIQUID',
+      MARKET_DATA_FALLBACK_TO_MOCK: false,
+      ALCHEMY_ADDRESS_ACTIVITY_ENABLED: true,
+      ALCHEMY_WEBHOOK_SIGNING_KEYS_JSON: JSON.stringify({ wh_arbitrum: 'secret' }),
+    });
+
+    expect(result.error).toBeDefined();
+  });
+
+  it('accepts complete production webhook configuration', () => {
+    const result = envValidationSchema.validate({
+      ...baseEnv,
+      NODE_ENV: 'production',
+      MARKET_DATA_PROVIDER: 'HYPERLIQUID',
+      MARKET_DATA_FALLBACK_TO_MOCK: false,
+      ALCHEMY_ADDRESS_ACTIVITY_ENABLED: true,
+      ALCHEMY_WEBHOOK_SIGNING_KEYS_JSON: JSON.stringify({ wh_arbitrum: 'secret' }),
+      ALCHEMY_WEBHOOK_AUTH_TOKEN: 'notify-auth-token',
+      ALCHEMY_WEBHOOK_IDS_JSON: JSON.stringify({ arbitrum: 'wh_arbitrum' }),
+    });
+
+    expect(result.error).toBeUndefined();
+  });
+
   it('allows an empty treasury asset list for per-network auto discovery', () => {
     const result = envValidationSchema.validate({
       ...baseEnv,

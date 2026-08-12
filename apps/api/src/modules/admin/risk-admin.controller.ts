@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Param, Patch, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Param, Patch, UseGuards } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Prisma, UserRole } from '@prisma/client';
 import {
@@ -78,7 +79,30 @@ export class RiskAdminController {
     private readonly settings: OperationalSettingsService,
     private readonly hyperliquid: HyperliquidExecutionService,
     private readonly audit: AuditService,
+    private readonly config: ConfigService,
   ) {}
+
+  @Get('bbook/status')
+  async bbookStatus() {
+    const [paused, exposures] = await Promise.all([
+      this.settings.getBoolean('bbook:paused', 'BBOOK_PAUSED', false),
+      this.prisma.bBookExposure.findMany({ include: { market: true } }),
+    ]);
+    const capital = new Prisma.Decimal(this.config.get<string>('PLATFORM_CAPITAL_USDC', '0'));
+    const insurance = new Prisma.Decimal(this.config.get<string>('INSURANCE_CAPITAL_USDC', '0'));
+    const minimumCapital = new Prisma.Decimal(this.config.get<string>('BBOOK_MIN_PLATFORM_CAPITAL_USDC', '500'));
+    const minimumInsurance = new Prisma.Decimal(this.config.get<string>('BBOOK_MIN_INSURANCE_CAPITAL_USDC', '100'));
+    return {
+      enabled: this.config.get<boolean>('BBOOK_ENABLED', false),
+      paused,
+      funded: capital.greaterThanOrEqualTo(minimumCapital) && insurance.greaterThanOrEqualTo(minimumInsurance),
+      capital: capital.toString(),
+      insurance: insurance.toString(),
+      minimumCapital: minimumCapital.toString(),
+      minimumInsurance: minimumInsurance.toString(),
+      exposures,
+    };
+  }
 
   @Get('overview')
   async overview() {
@@ -106,7 +130,12 @@ export class RiskAdminController {
       this.prisma.systemSetting.findMany({
         where: {
           key: {
-            in: ['trading:paused', 'withdrawals:paused', 'bbook:paused'],
+            in: [
+              'trading:paused',
+              'abook:reconciliation-paused',
+              'withdrawals:paused',
+              'bbook:paused',
+            ],
           },
         },
       }),
@@ -181,7 +210,27 @@ export class RiskAdminController {
   }
 
   @Patch('pause/bbook')
-  pauseBbook(@CurrentUser() user: AuthenticatedUser, @Body() dto: PauseDto) {
+  async pauseBbook(@CurrentUser() user: AuthenticatedUser, @Body() dto: PauseDto) {
+    if (!dto.enabled) {
+      const capital = new Prisma.Decimal(this.config.get<string>('PLATFORM_CAPITAL_USDC', '0'));
+      const insurance = new Prisma.Decimal(this.config.get<string>('INSURANCE_CAPITAL_USDC', '0'));
+      const minimumCapital = new Prisma.Decimal(this.config.get<string>('BBOOK_MIN_PLATFORM_CAPITAL_USDC', '500'));
+      const minimumInsurance = new Prisma.Decimal(this.config.get<string>('BBOOK_MIN_INSURANCE_CAPITAL_USDC', '100'));
+      if (
+        !this.config.get<boolean>('BBOOK_ENABLED', false) ||
+        capital.lessThan(minimumCapital) ||
+        insurance.lessThan(minimumInsurance)
+      ) {
+        throw new BadRequestException({
+          code: 'BBOOK_ACTIVATION_GATES_FAILED',
+          reasons: [
+            ...(!this.config.get<boolean>('BBOOK_ENABLED', false) ? ['BBOOK_DISABLED'] : []),
+            ...(capital.lessThan(minimumCapital) ? ['PLATFORM_CAPITAL_INSUFFICIENT'] : []),
+            ...(insurance.lessThan(minimumInsurance) ? ['INSURANCE_CAPITAL_INSUFFICIENT'] : []),
+          ],
+        });
+      }
+    }
     return this.setPause(user.id, 'bbook:paused', dto.enabled);
   }
 

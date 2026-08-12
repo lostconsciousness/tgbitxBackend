@@ -17,7 +17,11 @@ import { OperationalSettingsService } from '../settings/operational-settings.ser
 
 @Injectable()
 export class ReconciliationService {
+  private static readonly providerPositionOffsetPrefix =
+    'abook:provider-position-offset:';
+  private static readonly providerMismatchConfirmationMs = 5_000;
   private readonly logger = new Logger(ReconciliationService.name);
+  private readonly providerMismatchFirstSeenAt = new Map<string, number>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -245,7 +249,12 @@ export class ReconciliationService {
           },
         };
       }
-      const providerState = await this.hyperliquid.getAccountState();
+      const [providerState, providerPositionOffsets] = await Promise.all([
+        this.hyperliquid.getAccountState(),
+        this.settings.getDecimalsByPrefix(
+          ReconciliationService.providerPositionOffsetPrefix,
+        ),
+      ]);
       const internalBySymbol = new Map<string, Prisma.Decimal>();
       const precisionBySymbol = new Map<string, number>();
       for (const position of internalPositions) {
@@ -271,26 +280,88 @@ export class ReconciliationService {
           providerBySymbol.set(symbol, new Prisma.Decimal(size));
         }
       }
-      const symbols = new Set([...internalBySymbol.keys(), ...providerBySymbol.keys()]);
-      const mismatches = [...symbols].flatMap((symbol) => {
+      const symbols = new Set([
+        ...internalBySymbol.keys(),
+        ...providerBySymbol.keys(),
+        ...providerPositionOffsets.keys(),
+      ]);
+      const observedMismatches = [...symbols].flatMap((symbol) => {
         const internalSize = new Prisma.Decimal(internalBySymbol.get(symbol) ?? 0);
         const providerSize = new Prisma.Decimal(providerBySymbol.get(symbol) ?? 0);
+        const providerResidual = new Prisma.Decimal(
+          providerPositionOffsets.get(symbol) ?? 0,
+        );
+        const expectedProviderSize = internalSize.plus(providerResidual);
         const tolerance = new Prisma.Decimal(10).pow(
           -(precisionBySymbol.get(symbol) ?? 8),
         );
-        return internalSize.minus(providerSize).abs().greaterThan(tolerance)
-          ? [{ symbol, internalSize: internalSize.toString(), providerSize: providerSize.toString() }]
+        return expectedProviderSize.minus(providerSize).abs().greaterThan(tolerance)
+          ? [{
+              symbol,
+              internalSize: internalSize.toString(),
+              providerResidual: providerResidual.toString(),
+              expectedProviderSize: expectedProviderSize.toString(),
+              providerSize: providerSize.toString(),
+            }]
           : [];
       });
+      const observedSymbols = new Set(
+        observedMismatches.map((mismatch) => mismatch.symbol),
+      );
+      for (const symbol of this.providerMismatchFirstSeenAt.keys()) {
+        if (!observedSymbols.has(symbol)) {
+          this.providerMismatchFirstSeenAt.delete(symbol);
+        }
+      }
+      const now = Date.now();
+      const mismatches = [] as typeof observedMismatches;
+      const pendingMismatches = [] as typeof observedMismatches;
+      for (const mismatch of observedMismatches) {
+        const firstSeenAt = this.providerMismatchFirstSeenAt.get(mismatch.symbol);
+        if (firstSeenAt === undefined) {
+          this.providerMismatchFirstSeenAt.set(mismatch.symbol, now);
+          pendingMismatches.push(mismatch);
+        } else if (
+          now - firstSeenAt >= ReconciliationService.providerMismatchConfirmationMs
+        ) {
+          mismatches.push(mismatch);
+        } else {
+          pendingMismatches.push(mismatch);
+        }
+      }
+      if (observedMismatches.length === 0) {
+        await this.settings.setBoolean('abook:reconciliation-paused', false);
+      } else if (mismatches.length > 0) {
+        await this.settings.setBoolean('abook:reconciliation-paused', true);
+      }
       return {
         passed: mismatches.length === 0,
         details: {
           enabled: true,
           checkedSymbols: symbols.size,
+          providerPositionOffsets: [...providerPositionOffsets.entries()].map(
+            ([symbol, size]) => ({ symbol, size: size.toString() }),
+          ),
           mismatches,
+          pendingMismatches,
         },
       };
     });
+  }
+
+  async setProviderPositionOffset(symbol: string, size: Prisma.Decimal.Value) {
+    const providerSymbol = symbol.trim().toUpperCase();
+    const market = await this.prisma.market.findFirst({
+      where: { providerName: 'HYPERLIQUID', providerSymbol },
+      select: { id: true },
+    });
+    if (!market) {
+      throw new Error(`Unknown Hyperliquid provider symbol: ${providerSymbol}`);
+    }
+    return this.settings.setDecimal(
+      `${ReconciliationService.providerPositionOffsetPrefix}${providerSymbol}`,
+      size,
+    );
   }
 
   async runBbookExposureCheck() {

@@ -6,5 +6,8 @@ module.exports = {
   transform: {
     '^.+\\.(t|j)s$': 'ts-jest',
   },
+  moduleNameMapper: {
+    '^@nktkas/hyperliquid/utils$': '<rootDir>/test/mocks/hyperliquid-utils.ts',
+  },
   collectCoverageFrom: ['src/**/*.(t|j)s'],
 };

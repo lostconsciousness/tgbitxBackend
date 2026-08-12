@@ -13,6 +13,10 @@ import { DepositAddressService } from './deposit-address.service';
 import { DepositSweepService } from './deposit-sweep.service';
 import { AccountModule } from '../account/account.module';
 import { RealtimeModule } from '../realtime/realtime.module';
+import { DepositIntentCleanupService } from './deposit-intent-cleanup.service';
+import { AlchemyDepositWebhookController } from './alchemy-deposit-webhook.controller';
+import { AlchemyDepositWebhookService } from './alchemy-deposit-webhook.service';
+import { AlchemyWebhookAddressSyncService } from './alchemy-webhook-address-sync.service';
 
 @Module({
   imports: [
@@ -26,12 +30,15 @@ import { RealtimeModule } from '../realtime/realtime.module';
     AccountModule,
     RealtimeModule,
   ],
-  controllers: [DepositsController],
+  controllers: [DepositsController, AlchemyDepositWebhookController],
   providers: [
     DepositsService,
     DepositIndexerService,
     DepositAddressService,
     DepositSweepService,
+    DepositIntentCleanupService,
+    AlchemyDepositWebhookService,
+    AlchemyWebhookAddressSyncService,
   ],
   exports: [
     DepositsService,

@@ -4,6 +4,11 @@ export type Balance = {
   value: string;
 };
 
+export type BalanceRequest = {
+  token?: string;
+  tokenDecimals?: number;
+};
+
 export type Tx = {
   hash: string;
   blockNumber?: number;
@@ -32,7 +37,7 @@ export type BlockWithTransactions = {
 
 export type LogFilter = {
   networkKey?: string;
-  address?: string;
+  address?: string | string[];
   topics?: Array<string | string[] | null>;
   fromBlock?: number | string;
   toBlock?: number | string;
@@ -57,6 +62,11 @@ export interface RpcProvider {
     networkKey?: string,
     tokenDecimals?: number,
   ): Promise<Balance>;
+  getBalances?(
+    address: string,
+    requests: BalanceRequest[],
+    networkKey?: string,
+  ): Promise<Balance[]>;
   getTransaction(txHash: string, networkKey?: string): Promise<Tx>;
   getBlockWithTransactions(blockNumber: number, networkKey?: string): Promise<BlockWithTransactions>;
   getLogs(filter: LogFilter): Promise<RpcLog[]>;

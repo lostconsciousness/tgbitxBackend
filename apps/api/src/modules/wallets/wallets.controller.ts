@@ -26,6 +26,8 @@ import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../database/prisma.service';
 import { Chain, NetworkFamily } from '@prisma/client';
 import { AccountService } from '../account/account.service';
+import { Optional } from '@nestjs/common';
+import { UserUpdatesService } from '../user-updates/user-updates.service';
 
 @ApiTags('wallets')
 @ApiBearerAuth()
@@ -38,6 +40,7 @@ export class WalletsController {
     private readonly config: ConfigService,
     private readonly prisma: PrismaService,
     private readonly accountService: AccountService,
+    @Optional() private readonly userUpdates?: UserUpdatesService,
   ) {}
 
   @Get()
@@ -121,6 +124,7 @@ export class WalletsController {
       signature: dto.signature,
       audit: getRequestMetadata(request),
     });
+    this.userUpdates?.publish(user.id, ['wallets']);
     return wallet;
   }
 
@@ -159,6 +163,7 @@ export class WalletsController {
       }));
     }
     const primary = wallets.find((wallet) => wallet.isPrimary) ?? wallets[0];
+    this.userUpdates?.publish(user.id, ['wallets']);
     return { ...primary, wallets };
   }
 
@@ -169,11 +174,13 @@ export class WalletsController {
     @Param('id') walletId: string,
     @Req() request: Request,
   ) {
-    return this.walletsService.setPrimaryWallet(
+    const wallet = await this.walletsService.setPrimaryWallet(
       user.id,
       walletId,
       getRequestMetadata(request),
     );
+    this.userUpdates?.publish(user.id, ['wallets']);
+    return wallet;
   }
 
   @Delete(':id')
@@ -183,10 +190,12 @@ export class WalletsController {
     @Param('id') walletId: string,
     @Req() request: Request,
   ) {
-    return this.walletsService.revokeWallet(
+    const wallet = await this.walletsService.revokeWallet(
       user.id,
       walletId,
       getRequestMetadata(request),
     );
+    this.userUpdates?.publish(user.id, ['wallets']);
+    return wallet;
   }
 }

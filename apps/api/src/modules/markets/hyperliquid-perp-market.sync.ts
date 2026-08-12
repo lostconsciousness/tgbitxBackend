@@ -50,8 +50,8 @@ function minOrderSizeForSzDecimals(szDecimals: number): string {
   return `0.${'0'.repeat(Math.max(0, szDecimals - 1))}1`;
 }
 
-function tradingViewSymbolFor(baseAssetSymbol: string): string {
-  return `HYPERLIQUID:${baseAssetSymbol}USDC`;
+export function hyperliquidTradingViewSymbolFor(providerSymbol: string): string {
+  return `HYPERLIQUID:${providerSymbol.toUpperCase()}USDC.P`;
 }
 
 export async function syncHyperliquidPerpMarkets(
@@ -121,7 +121,7 @@ export async function syncHyperliquidPerpMarkets(
         quoteAssetId: usdc.id,
         providerName: 'HYPERLIQUID',
         providerSymbol: hlAsset.name,
-        tradingViewSymbol: tradingViewSymbolFor(baseAssetSymbol),
+        tradingViewSymbol: hyperliquidTradingViewSymbolFor(hlAsset.name),
         orderbookEnabled: true,
         pricePrecision,
         sizePrecision,
@@ -135,7 +135,7 @@ export async function syncHyperliquidPerpMarkets(
         quoteAssetId: usdc.id,
         providerName: 'HYPERLIQUID',
         providerSymbol: hlAsset.name,
-        tradingViewSymbol: tradingViewSymbolFor(baseAssetSymbol),
+        tradingViewSymbol: hyperliquidTradingViewSymbolFor(hlAsset.name),
         orderbookEnabled: true,
         pricePrecision,
         sizePrecision,

@@ -12,7 +12,14 @@ import {
   parseAbi,
   verifyMessage,
 } from 'viem';
-import { Balance, LogFilter, RpcLog, RpcProvider, Tx } from './rpc-provider.interface';
+import {
+  Balance,
+  BalanceRequest,
+  LogFilter,
+  RpcLog,
+  RpcProvider,
+  Tx,
+} from './rpc-provider.interface';
 
 const ERC20_ABI = parseAbi([
   'function balanceOf(address owner) view returns (uint256)',
@@ -23,6 +30,11 @@ const ERC1271_ABI = parseAbi([
   'function isValidSignature(bytes32 hash, bytes signature) view returns (bytes4)',
 ]);
 const ERC1271_MAGIC_VALUE = '0x1626ba7e';
+const MULTICALL3_ADDRESS = getAddress('0xcA11bde05977b3631167028862bE2a173976CA11');
+const MULTICALL3_ABI = parseAbi([
+  'function getEthBalance(address addr) view returns (uint256 balance)',
+  'function aggregate3((address target, bool allowFailure, bytes callData)[] calls) payable returns ((bool success, bytes returnData)[] returnData)',
+]);
 
 type JsonRpcResponse<T> = {
   result?: T;
@@ -64,6 +76,11 @@ type RawLog = {
 
 export class ViemRpcProvider implements RpcProvider {
   private readonly rpcCooldownUntil = new Map<string, number>();
+  private readonly latestBlockCache = new Map<
+    string,
+    { expiresAt: number; value: Promise<number> }
+  >();
+  private readonly erc20DecimalsCache = new Map<string, Promise<number>>();
 
   constructor(private readonly config: ConfigService) {}
 
@@ -116,6 +133,93 @@ export class ViemRpcProvider implements RpcProvider {
       address: normalizedAddress,
       value: BigInt(value).toString(),
     };
+  }
+
+  async getBalances(
+    address: string,
+    requests: BalanceRequest[],
+    networkKey?: string,
+  ): Promise<Balance[]> {
+    const owner = getAddress(address);
+    if (requests.length === 0) return [];
+    try {
+      const calls = requests.map((request) =>
+        request.token
+          ? {
+              target: getAddress(request.token),
+              allowFailure: true,
+              callData: encodeFunctionData({
+                abi: ERC20_ABI,
+                functionName: 'balanceOf',
+                args: [owner],
+              }),
+            }
+          : {
+              target: MULTICALL3_ADDRESS,
+              allowFailure: true,
+              callData: encodeFunctionData({
+                abi: MULTICALL3_ABI,
+                functionName: 'getEthBalance',
+                args: [owner],
+              }),
+            },
+      );
+      const data = encodeFunctionData({
+        abi: MULTICALL3_ABI,
+        functionName: 'aggregate3',
+        args: [calls],
+      });
+      const raw = await this.requestRpc<Hex>(
+        'eth_call',
+        [{ to: MULTICALL3_ADDRESS, data }, 'latest'],
+        networkKey,
+      );
+      const results = decodeFunctionResult({
+        abi: MULTICALL3_ABI,
+        functionName: 'aggregate3',
+        data: raw,
+      });
+      return Promise.all(results.map(async (result, index) => {
+        const request = requests[index];
+        if (!result.success) {
+          return this.getBalance(
+            owner,
+            request?.token,
+            networkKey,
+            request?.tokenDecimals,
+          );
+        }
+        if (!request?.token) {
+          const value = decodeFunctionResult({
+            abi: MULTICALL3_ABI,
+            functionName: 'getEthBalance',
+            data: result.returnData,
+          });
+          return { address: owner, value: value.toString() };
+        }
+        const value = decodeFunctionResult({
+          abi: ERC20_ABI,
+          functionName: 'balanceOf',
+          data: result.returnData,
+        });
+        return {
+          address: owner,
+          token: getAddress(request.token),
+          value: formatUnits(value, request.tokenDecimals ?? 18),
+        };
+      }));
+    } catch (_error) {
+      return Promise.all(
+        requests.map((request) =>
+          this.getBalance(
+            owner,
+            request.token,
+            networkKey,
+            request.tokenDecimals,
+          ),
+        ),
+      );
+    }
   }
 
   async getTransaction(txHash: string, networkKey?: string): Promise<Tx> {
@@ -200,8 +304,20 @@ export class ViemRpcProvider implements RpcProvider {
   }
 
   async getLatestBlockNumber(networkKey?: string): Promise<number> {
-    const blockNumber = await this.requestRpc<Hex>('eth_blockNumber', [], networkKey);
-    return hexToNumber(blockNumber);
+    const key = networkKey?.trim().toLowerCase() ?? '__default__';
+    const cached = this.latestBlockCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.value;
+    }
+    const value = this.requestRpc<Hex>('eth_blockNumber', [], networkKey)
+      .then((blockNumber) => hexToNumber(blockNumber));
+    this.latestBlockCache.set(key, { expiresAt: Date.now() + 2_000, value });
+    try {
+      return await value;
+    } catch (error) {
+      this.latestBlockCache.delete(key);
+      throw error;
+    }
   }
 
   sendTransaction(signedTx: string, networkKey?: string): Promise<string> {
@@ -265,6 +381,22 @@ export class ViemRpcProvider implements RpcProvider {
   }
 
   private async readErc20Decimals(tokenAddress: Address, networkKey?: string): Promise<number> {
+    const cacheKey = `${networkKey?.trim().toLowerCase() ?? '__default__'}:${tokenAddress.toLowerCase()}`;
+    const cached = this.erc20DecimalsCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+    const value = this.fetchErc20Decimals(tokenAddress, networkKey);
+    this.erc20DecimalsCache.set(cacheKey, value);
+    try {
+      return await value;
+    } catch (error) {
+      this.erc20DecimalsCache.delete(cacheKey);
+      throw error;
+    }
+  }
+
+  private async fetchErc20Decimals(tokenAddress: Address, networkKey?: string): Promise<number> {
     const data = encodeFunctionData({
       abi: ERC20_ABI,
       functionName: 'decimals',

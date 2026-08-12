@@ -59,7 +59,10 @@ describe('ReconciliationService provider checks', () => {
         }]),
       },
     };
-    const settings = { setBoolean: jest.fn() };
+    const settings = {
+      setBoolean: jest.fn(),
+      getDecimalsByPrefix: jest.fn().mockResolvedValue(new Map()),
+    };
     const service = new ReconciliationService(
       prisma as unknown as PrismaService,
       {} as TreasuryService,
@@ -72,12 +75,75 @@ describe('ReconciliationService provider checks', () => {
       settings as unknown as OperationalSettingsService,
     );
 
+    const now = jest.spyOn(Date, 'now');
+    now.mockReturnValueOnce(1_000);
+    const pending = await service.runProviderPositionsCheck();
+    now.mockReturnValueOnce(7_000);
     const result = await service.runProviderPositionsCheck();
 
-    expect(settings.setBoolean).not.toHaveBeenCalled();
+    expect(settings.setBoolean).toHaveBeenCalledWith(
+      'abook:reconciliation-paused',
+      true,
+    );
+    expect(pending).toMatchObject({
+      status: ReconciliationStatus.PASSED,
+      details: {
+        mismatches: [],
+        pendingMismatches: [expect.objectContaining({ symbol: 'BTC' })],
+      },
+    });
     expect(result).toMatchObject({
       status: ReconciliationStatus.FAILED,
       details: { mismatches: [expect.objectContaining({ symbol: 'BTC' })] },
+    });
+    now.mockRestore();
+  });
+
+  it('accounts for audited provider residual inventory without changing user positions', async () => {
+    const prisma = {
+      reconciliationRun: {
+        create: jest.fn().mockResolvedValue({ id: 'run-3' }),
+        update: jest.fn().mockImplementation(({ data }: { data: unknown }) => data),
+      },
+      position: {
+        findMany: jest.fn().mockResolvedValue([{
+          side: PositionSide.SHORT,
+          size: new Prisma.Decimal('0.00159'),
+          market: { providerSymbol: 'BTC', sizePrecision: 5 },
+        }]),
+      },
+    };
+    const settings = {
+      setBoolean: jest.fn(),
+      getDecimalsByPrefix: jest.fn().mockResolvedValue(
+        new Map([['BTC', new Prisma.Decimal('0.00003')]]),
+      ),
+    };
+    const service = new ReconciliationService(
+      prisma as unknown as PrismaService,
+      {} as TreasuryService,
+      {
+        isExecutionEnabled: jest.fn().mockReturnValue(true),
+        getAccountState: jest.fn().mockResolvedValue({
+          assetPositions: [{ position: { coin: 'BTC', szi: '-0.00156' } }],
+        }),
+      } as unknown as HyperliquidExecutionService,
+      settings as unknown as OperationalSettingsService,
+    );
+
+    const result = await service.runProviderPositionsCheck();
+
+    expect(settings.setBoolean).toHaveBeenCalledWith(
+      'abook:reconciliation-paused',
+      false,
+    );
+    expect(result).toMatchObject({
+      status: ReconciliationStatus.PASSED,
+      details: {
+        providerPositionOffsets: [{ symbol: 'BTC', size: '0.00003' }],
+        mismatches: [],
+        pendingMismatches: [],
+      },
     });
   });
 });

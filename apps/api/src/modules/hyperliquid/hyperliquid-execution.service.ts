@@ -1,4 +1,4 @@
-import { Injectable, ServiceUnavailableException } from '@nestjs/common';
+import { Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { OrderSide, OrderType } from '@prisma/client';
 import {
@@ -14,7 +14,10 @@ import { formatHyperliquidPrice, formatHyperliquidSize } from './hyperliquid-ord
 
 @Injectable()
 export class HyperliquidExecutionService implements PerpLiquidityProvider {
+  private readonly logger = new Logger(HyperliquidExecutionService.name);
   private readinessCache?: { expiresAt: number; value: ProviderReadiness };
+  private transientFailures = 0;
+  private circuitOpenUntil = 0;
   constructor(
     private readonly config: ConfigService,
     private readonly custody: PrivyCustodyService,
@@ -55,6 +58,7 @@ export class HyperliquidExecutionService implements PerpLiquidityProvider {
       return value;
     }
     let accountValue: string | undefined;
+    let withdrawable: string | undefined;
     let agentRegistered = false;
     try {
       const masterWalletId = this.config.getOrThrow<string>('PRIVY_HYPERLIQUID_MASTER_WALLET_ID');
@@ -78,8 +82,17 @@ export class HyperliquidExecutionService implements PerpLiquidityProvider {
       );
       if (!agentRegistered) reasons.push('AGENT_NOT_REGISTERED');
       accountValue = String((state as any)?.marginSummary?.accountValue ?? '0');
+      withdrawable = String((state as any)?.withdrawable ?? '0');
       const minimum = Number(this.config.get<string>('HYPERLIQUID_MIN_ACCOUNT_VALUE_USDC', '25'));
-      if (!Number.isFinite(Number(accountValue)) || Number(accountValue) < minimum) {
+      const minimumWithdrawable = Number(
+        this.config.get<string>('HYPERLIQUID_MIN_WITHDRAWABLE_USDC', '5'),
+      );
+      if (
+        !Number.isFinite(Number(accountValue)) ||
+        Number(accountValue) < minimum ||
+        !Number.isFinite(Number(withdrawable)) ||
+        Number(withdrawable) < minimumWithdrawable
+      ) {
         reasons.push('COLLATERAL_INSUFFICIENT');
       }
       if (this.config.get<string>('MARKET_DATA_PROVIDER', 'MOCK') !== 'HYPERLIQUID') {
@@ -92,6 +105,7 @@ export class HyperliquidExecutionService implements PerpLiquidityProvider {
       ready: reasons.length === 0,
       reasons: [...new Set(reasons)],
       accountValue,
+      withdrawable,
       masterAddressConfigured: true,
       agentAddressConfigured: true,
       agentRegistered,
@@ -101,6 +115,7 @@ export class HyperliquidExecutionService implements PerpLiquidityProvider {
   }
 
   async placeOrder(input: ProviderOrderInput): Promise<ProviderOrderResult> {
+    return this.withProviderResilience('placeOrder', false, async () => {
     const { client, info } = await this.createClients();
     const meta = await info.meta();
     const asset = meta.universe.findIndex((item) => item.name === input.providerSymbol);
@@ -169,6 +184,7 @@ export class HyperliquidExecutionService implements PerpLiquidityProvider {
       status: 'OPEN',
       raw: response,
     };
+    });
   }
 
   async cancelOrder(input: {
@@ -176,6 +192,7 @@ export class HyperliquidExecutionService implements PerpLiquidityProvider {
     providerOrderId?: string;
     cloid?: `0x${string}`;
   }): Promise<void> {
+    return this.withProviderResilience('cancelOrder', false, async () => {
     const { client, info } = await this.createClients();
     const meta = await info.meta();
     const asset = meta.universe.findIndex((item) => item.name === input.providerSymbol);
@@ -191,9 +208,11 @@ export class HyperliquidExecutionService implements PerpLiquidityProvider {
       return;
     }
     throw new ServiceUnavailableException('Provider order identifier is missing');
+    });
   }
 
   async getOrderSnapshot(cloid: `0x${string}`): Promise<ProviderOrderSnapshot> {
+    return this.withProviderResilience('getOrderSnapshot', true, async () => {
     const { info } = await this.createClients();
     const master = this.config.getOrThrow<string>('HYPERLIQUID_MASTER_ADDRESS') as `0x${string}`;
     const response = await info.orderStatus({ user: master, oid: cloid });
@@ -217,9 +236,11 @@ export class HyperliquidExecutionService implements PerpLiquidityProvider {
       reason: status === 'REJECTED' ? state : undefined,
       raw: response,
     };
+    });
   }
 
   async getOrderFills(cloid: `0x${string}`): Promise<ProviderFillResult[]> {
+    return this.withProviderResilience('getOrderFills', true, async () => {
     const { info } = await this.createClients();
     const master = this.config.getOrThrow<string>('HYPERLIQUID_MASTER_ADDRESS') as `0x${string}`;
     const fills = await info.userFills({ user: master, aggregateByTime: false });
@@ -232,6 +253,7 @@ export class HyperliquidExecutionService implements PerpLiquidityProvider {
       occurredAt: new Date(fill.time),
       raw: fill,
     }));
+    });
   }
 
   async getAccountState(): Promise<unknown> {
@@ -311,6 +333,60 @@ export class HyperliquidExecutionService implements PerpLiquidityProvider {
       client: new hl.ExchangeClient({ transport, wallet: wallet as never }),
       info: new hl.InfoClient({ transport }),
     };
+  }
+
+  private async withProviderResilience<T>(
+    operation: string,
+    retrySafe: boolean,
+    execute: () => Promise<T>,
+  ): Promise<T> {
+    const now = Date.now();
+    if (this.circuitOpenUntil > now) {
+      throw new ServiceUnavailableException(
+        `Hyperliquid circuit is open for ${this.circuitOpenUntil - now}ms`,
+      );
+    }
+    const attempts = retrySafe
+      ? this.config.get<number>('HYPERLIQUID_RETRY_ATTEMPTS', 3)
+      : 1;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        const result = await execute();
+        this.transientFailures = 0;
+        this.circuitOpenUntil = 0;
+        return result;
+      } catch (error) {
+        lastError = error;
+        if (!this.isTransientProviderError(error)) throw error;
+        this.transientFailures += 1;
+        const threshold = this.config.get<number>('HYPERLIQUID_CIRCUIT_FAILURE_THRESHOLD', 5);
+        if (this.transientFailures >= threshold) {
+          const cooldown = this.config.get<number>('HYPERLIQUID_CIRCUIT_COOLDOWN_MS', 15_000);
+          this.circuitOpenUntil = Date.now() + cooldown;
+          this.logger.warn(
+            `Hyperliquid circuit opened after ${this.transientFailures} transient failures`,
+          );
+          break;
+        }
+        if (attempt < attempts - 1) {
+          const base = this.config.get<number>('HYPERLIQUID_RETRY_BASE_DELAY_MS', 250);
+          const max = this.config.get<number>('HYPERLIQUID_RETRY_MAX_DELAY_MS', 3_000);
+          const backoff = Math.min(max, base * 2 ** attempt);
+          const jitter = Math.floor(Math.random() * Math.max(1, Math.floor(backoff / 4)));
+          await new Promise((resolve) => setTimeout(resolve, backoff + jitter));
+        }
+      }
+    }
+    const message = lastError instanceof Error ? lastError.message : 'provider unavailable';
+    throw new ServiceUnavailableException(`Hyperliquid ${operation} failed: ${message}`);
+  }
+
+  private isTransientProviderError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /\b429\b|\b5\d\d\b|timeout|timed out|aborted|network|fetch failed|ECONN|circuit is open/i.test(
+      message,
+    );
   }
 
   private dynamicImport(specifier: string): Promise<unknown> {

@@ -9,10 +9,16 @@ describe('ConvertService quotes', () => {
         CONVERT_SOL_ENABLED: true,
         CONVERT_TRON_ENABLED: true,
         CONVERT_EVM_ENABLED: true,
+        CONVERT_ENABLED: true,
         CONVERT_FEE_BPS: 20,
         CONVERT_EVM_GAS_RESERVE: '0.00015',
+        PRIVY_SPOT_LIQUIDITY_WALLET_ID: 'spot-wallet',
       };
       return values[key] ?? fallback;
+    }),
+    getOrThrow: jest.fn((key: string) => {
+      if (key === 'PRIVY_SPOT_LIQUIDITY_WALLET_ID') return 'spot-wallet';
+      throw new Error(`Missing test config: ${key}`);
     }),
   } as unknown as ConfigService;
 
@@ -21,6 +27,7 @@ describe('ConvertService quotes', () => {
       quoteExactInput: jest.fn().mockResolvedValue({
         dstAmount: '1000000000000000000',
       }),
+      getSpotPrices: jest.fn().mockResolvedValue({}),
     };
     const marketData = {
       getOrderBook: jest.fn().mockResolvedValue({
@@ -28,6 +35,7 @@ describe('ConvertService quotes', () => {
         asks: [{ price: '101', size: '1', orders: 1 }],
         time: Date.now(),
       }),
+      getTickers: jest.fn().mockResolvedValue([]),
     };
     const custody = {
       isSolanaEnabled: jest.fn().mockReturnValue(true),
@@ -40,6 +48,7 @@ describe('ConvertService quotes', () => {
         value: token ? '1000000' : '1000000000000000000',
       })),
     };
+    const updates = { publish: jest.fn() };
     const instance = new ConvertService(
       {} as any,
       config,
@@ -48,10 +57,177 @@ describe('ConvertService quotes', () => {
       oneInch as any,
       custody as any,
       rpc as any,
+      updates as any,
     );
     jest.spyOn(instance as any, 'assertReserveCoverage').mockResolvedValue(undefined);
-    return { instance, oneInch, marketData };
+    return { instance, oneInch, marketData, updates };
   }
+
+  it('publishes a balance refresh after a committed conversion state change', () => {
+    const { instance, updates } = service();
+
+    (instance as any).publishBalanceUpdate('user-1');
+
+    expect(updates.publish).toHaveBeenCalledWith('user-1', ['balances']);
+  });
+
+  it('caches conversion readiness to avoid repeated multi-network balance RPC calls', async () => {
+    const { instance } = service();
+    const compute = jest.spyOn(instance as any, 'computeReadiness').mockResolvedValue({
+      enabled: true,
+      evm: { enabled: true, networks: [] },
+    });
+
+    await instance.getReadiness();
+    await instance.getReadiness();
+
+    expect(compute).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns only Spot assets that have a common executable stablecoin network', async () => {
+    const { instance } = service();
+    jest.spyOn(instance as any, 'getSpotCatalogFundedQuotes').mockResolvedValue(
+      new Map([['arbitrum', new Set(['USDC'])]]),
+    );
+    jest.spyOn(instance, 'listAssets').mockResolvedValue([
+      { symbol: 'BTC', name: 'Bitcoin', iconUrl: null, decimals: 8, enabled: false,
+        provider: ConversionProvider.ONEINCH, networks: [], networkHidden: true, reason: 'unavailable' },
+      { symbol: 'WBTC', name: 'Wrapped BTC', iconUrl: null, decimals: 8, enabled: true,
+        provider: ConversionProvider.ONEINCH, networks: ['arbitrum'], networkHidden: true, reason: null },
+      { symbol: 'USDC', name: 'USD Coin', iconUrl: null, decimals: 6, enabled: true,
+        provider: ConversionProvider.ONEINCH, networks: ['arbitrum'], networkHidden: true, reason: null },
+      { symbol: 'AVAX', name: 'Avalanche', iconUrl: null, decimals: 18, enabled: true,
+        provider: ConversionProvider.ONEINCH, networks: ['avalanche'], networkHidden: true, reason: null },
+    ]);
+    jest.spyOn(instance as any, 'getSpotTickers').mockResolvedValue([
+      { symbol: 'WBTC-USDC', price: '100', change24hPct: '0', volume24h: '1000', asOf: new Date().toISOString() },
+    ]);
+
+    const catalog = await instance.listSpotCatalog();
+
+    expect(catalog.assets.map((asset) => asset.symbol)).toEqual(['WBTC', 'USDC']);
+    expect(catalog.pairs).toEqual([
+      expect.objectContaining({ symbol: 'WBTC-USDC', preferredNetwork: 'arbitrum' }),
+    ]);
+    expect(catalog.assets.some((asset) => asset.symbol === 'BTC')).toBe(false);
+    expect(catalog.assets.some((asset) => asset.symbol === 'AVAX')).toBe(false);
+  });
+
+  it('enriches Spot prices with reference 24h statistics and sorts the catalog by notional', async () => {
+    const { instance } = service();
+    jest.spyOn(instance as any, 'getSpotCatalogFundedQuotes').mockResolvedValue(
+      new Map([['arbitrum', new Set(['USDC'])]]),
+    );
+    jest.spyOn(instance, 'listAssets').mockResolvedValue([
+      { symbol: 'AAVE', name: 'Aave', iconUrl: null, decimals: 18, enabled: true,
+        provider: ConversionProvider.ONEINCH, networks: ['arbitrum'], networkHidden: true, reason: null },
+      { symbol: 'ARB', name: 'Arbitrum', iconUrl: null, decimals: 18, enabled: true,
+        provider: ConversionProvider.ONEINCH, networks: ['arbitrum'], networkHidden: true, reason: null },
+      { symbol: 'USDC', name: 'USD Coin', iconUrl: null, decimals: 6, enabled: true,
+        provider: ConversionProvider.ONEINCH, networks: ['arbitrum'], networkHidden: true, reason: null },
+    ]);
+    jest.spyOn(instance as any, 'getSpotTickers').mockResolvedValue([
+      {
+        symbol: 'AAVE-USDC',
+        provider: 'ONEINCH_SPOT_PRICE',
+        network: 'arbitrum',
+        lastPrice: '100',
+        markPrice: '100',
+        priceChange24h: '1',
+        priceChangePct24h: '1',
+        volume24h: '100',
+        notional24h: '10000',
+        statsProvider: 'HYPERLIQUID_PERP_REFERENCE',
+        time: 1,
+      },
+      {
+        symbol: 'ARB-USDC',
+        provider: 'ONEINCH_SPOT_PRICE',
+        network: 'arbitrum',
+        lastPrice: '1',
+        markPrice: '1',
+        priceChange24h: '-0.1',
+        priceChangePct24h: '-10',
+        volume24h: '200000',
+        notional24h: '200000',
+        statsProvider: 'HYPERLIQUID_PERP_REFERENCE',
+        time: 1,
+      },
+    ]);
+
+    const catalog = await instance.listSpotCatalog();
+
+    expect(catalog.pairs.map((pair) => pair.symbol)).toEqual(['ARB-USDC', 'AAVE-USDC']);
+    expect(catalog.assets.map((asset) => asset.symbol)).toEqual(['ARB', 'AAVE', 'USDC']);
+    expect(catalog.tickers.map((ticker) => ticker.notional24h)).toEqual(['200000', '10000']);
+  });
+
+  it('keeps 1inch as the Spot price and adds Hyperliquid reference statistics', async () => {
+    const network = { chainKey: 'arbitrum', mainnet: true };
+    const contracts = [
+      {
+        standard: TokenStandard.ERC20,
+        address: '0x0000000000000000000000000000000000000001',
+        network,
+      },
+      {
+        standard: TokenStandard.ERC20,
+        address: '0x0000000000000000000000000000000000000002',
+        network,
+      },
+    ];
+    const prisma = {
+      asset: {
+        findMany: jest.fn().mockResolvedValue([
+          { symbol: 'AAVE', tokenContracts: [contracts[0]] },
+          { symbol: 'USDC', tokenContracts: [contracts[1]] },
+        ]),
+      },
+    };
+    const marketData = {
+      getTickers: jest.fn().mockResolvedValue([{
+        symbol: 'AAVE-PERP',
+        priceChangePct24h: '5',
+        volume24h: '1234',
+        notional24h: '120000',
+      }]),
+    };
+    const oneInch = {
+      getSpotPrices: jest.fn().mockResolvedValue({
+        '0x0000000000000000000000000000000000000001': '100',
+        '0x0000000000000000000000000000000000000002': '1',
+      }),
+    };
+    const instance = new ConvertService(
+      prisma as any,
+      config,
+      {} as any,
+      marketData as any,
+      oneInch as any,
+      {} as any,
+      {} as any,
+      undefined,
+    );
+
+    const tickers = await (instance as any).loadSpotTickers([{
+      symbol: 'AAVE-USDC',
+      baseAsset: 'AAVE',
+      quoteAsset: 'USDC',
+      preferredNetwork: 'arbitrum',
+    }]);
+
+    expect(tickers).toEqual([
+      expect.objectContaining({
+        symbol: 'AAVE-USDC',
+        lastPrice: '100',
+        priceChange24h: '5',
+        priceChangePct24h: '5',
+        volume24h: '1234',
+        notional24h: '120000',
+        statsProvider: 'HYPERLIQUID_PERP_REFERENCE',
+      }),
+    ]);
+  });
 
   it('quotes an inventory-backed SOL buy and exposes the 20 bps fee', async () => {
     const { instance } = service();
@@ -177,5 +353,23 @@ describe('ConvertService quotes', () => {
     ], token, wallet, 6);
 
     expect(amount.toString()).toBe('1');
+  });
+
+  it('rejects a confirmed transaction signed by a different custody wallet', () => {
+    const { instance } = service();
+
+    expect(() => (instance as any).assertEvmTransactionSender(
+      { from: '0x0000000000000000000000000000000000000002' },
+      '0x0000000000000000000000000000000000000001',
+    )).toThrow('unexpected custody wallet');
+  });
+
+  it('accepts a confirmed transaction signed by the selected Spot wallet', () => {
+    const { instance } = service();
+
+    expect(() => (instance as any).assertEvmTransactionSender(
+      { from: '0x0000000000000000000000000000000000000001' },
+      '0x0000000000000000000000000000000000000001',
+    )).not.toThrow();
   });
 });

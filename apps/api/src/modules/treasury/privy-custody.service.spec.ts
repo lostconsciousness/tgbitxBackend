@@ -394,10 +394,9 @@ describe('PrivyCustodyService', () => {
     );
   });
 
-  it('broadcasts Tron transactions through Privy tron_sendTransaction RPC', async () => {
-    const rpc = jest.fn().mockResolvedValue({
-      method: 'tron_sendTransaction',
-      data: { hash: 'tron-txid', transaction_id: 'privy-tron-tx-1' },
+  it('raw-signs the complete Tron transaction and broadcasts it without dropping calldata', async () => {
+    const rawSign = jest.fn().mockResolvedValue({
+      signature: `0x${'11'.repeat(64)}`,
     });
     const service = new PrivyCustodyService({
       get: jest.fn((key: string, fallback?: unknown) => {
@@ -426,13 +425,22 @@ describe('PrivyCustodyService', () => {
     (service as any).dynamicImport = jest.fn().mockResolvedValue({
       PrivyClient: class {
         wallets() {
-          return { rpc };
+          return {
+            get: jest.fn().mockResolvedValue({ address: 'TFrom' }),
+            rawSign,
+          };
         }
       },
     });
     (service as any).createTronWebClient = jest.fn().mockResolvedValue({
+      trx: {
+        ecRecover: jest.fn().mockReturnValue('TFrom'),
+        sendRawTransaction: jest.fn().mockResolvedValue({ result: true, txid: 'a'.repeat(64) }),
+      },
       transactionBuilder: {
         sendTrx: jest.fn().mockResolvedValue({
+          txID: 'a'.repeat(64),
+          raw_data_hex: 'aabb',
           raw_data: {
             contract: [{
               type: 'TransferContract',
@@ -458,16 +466,116 @@ describe('PrivyCustodyService', () => {
       mainnet: true,
     });
 
-    expect(rpc).toHaveBeenCalledWith(
+    expect(rawSign).toHaveBeenCalledWith(
       'tron-wallet-id',
       expect.objectContaining({
-        method: 'tron_sendTransaction',
-        caip2: 'tron:mainnet',
+        params: expect.objectContaining({
+          bytes: 'aabb',
+          encoding: 'hex',
+          hash_function: 'sha256',
+        }),
       }),
     );
     expect(result).toEqual({
-      txHash: 'tron-txid',
-      providerRequestId: 'privy-tron-tx-1',
+      txHash: 'a'.repeat(64),
     });
+  });
+
+  it('validates the exact Tron TRC20 transfer calldata before signing', () => {
+    const service = new PrivyCustodyService({} as ConfigService);
+    const recipientHex = '22'.repeat(20);
+    const calldata = `a9059cbb${recipientHex.padStart(64, '0')}${'64'.padStart(64, '0')}`;
+    expect(() => (service as any).assertTronTrc20Transfer({
+      transaction: {
+        raw_data_hex: 'aabb',
+        raw_data: {
+          contract: [{
+            type: 'TriggerSmartContract',
+            parameter: { value: {
+              owner_address: `41${'11'.repeat(20)}`,
+              contract_address: `41${'33'.repeat(20)}`,
+              data: calldata,
+            } },
+          }],
+        },
+      },
+      fromAddress: 'TFrom',
+      toAddress: 'TTo',
+      contractAddress: 'TContract',
+      rawAmount: 100n,
+      tronWeb: { address: { toHex: jest.fn((address: string) => ({
+        TFrom: `41${'11'.repeat(20)}`,
+        TTo: `41${recipientHex}`,
+        TContract: `41${'33'.repeat(20)}`,
+      })[address]) } },
+    })).not.toThrow();
+  });
+
+  it('rejects missing Tron TRC20 calldata before signing', () => {
+    const service = new PrivyCustodyService({} as ConfigService);
+    expect(() => (service as any).assertTronTrc20Transfer({
+      transaction: {
+        raw_data_hex: 'aabb',
+        raw_data: {
+          contract: [{
+            type: 'TriggerSmartContract',
+            parameter: { value: {
+              owner_address: `41${'11'.repeat(20)}`,
+              contract_address: `41${'33'.repeat(20)}`,
+              data: '',
+            } },
+          }],
+        },
+      },
+      fromAddress: 'TFrom',
+      toAddress: 'TTo',
+      contractAddress: 'TContract',
+      rawAmount: 100n,
+      tronWeb: { address: { toHex: jest.fn((address: string) => ({
+        TFrom: `41${'11'.repeat(20)}`,
+        TTo: `41${'22'.repeat(20)}`,
+        TContract: `41${'33'.repeat(20)}`,
+      })[address]) } },
+    })).toThrow('calldata is missing or malformed');
+  });
+
+  it('rejects a Tron signature that cannot recover the expected wallet', () => {
+    const service = new PrivyCustodyService({} as ConfigService);
+    expect(() => (service as any).normalizeTronSignature({
+      signature: `0x${'11'.repeat(64)}`,
+      transaction: { raw_data_hex: 'aabb', raw_data: { contract: [] } },
+      expectedAddress: 'TFrom',
+      tronWeb: { trx: { ecRecover: jest.fn().mockReturnValue('TOther') } },
+    })).toThrow('signature does not match wallet address');
+  });
+
+  it('rejects a malformed Tron smart-contract call instead of signing it', () => {
+    const service = new PrivyCustodyService({} as ConfigService);
+    expect(() => (service as any).assertTronTrc20Transfer({
+      transaction: { raw_data_hex: 'aabb', raw_data: { contract: [] } },
+      fromAddress: 'TFrom',
+      toAddress: 'TTo',
+      contractAddress: 'TContract',
+      rawAmount: 1n,
+      tronWeb: { address: { toHex: jest.fn() } },
+    })).toThrow('Expected one Tron TriggerSmartContract transaction');
+  });
+
+  it('rejects non-zero Tron call_value before raw signing', () => {
+    const service = new PrivyCustodyService({} as ConfigService);
+    expect(() => (service as any).assertTronTrc20Transfer({
+      transaction: {
+        raw_data_hex: 'aabb',
+        raw_data: { contract: [{
+          type: 'TriggerSmartContract',
+          parameter: { value: { call_value: 1 } },
+        }] },
+      },
+      fromAddress: 'TFrom',
+      toAddress: 'TTo',
+      contractAddress: 'TContract',
+      rawAmount: 1n,
+      tronWeb: { address: { toHex: jest.fn() } },
+    })).toThrow();
   });
 });

@@ -32,6 +32,7 @@ import { RealtimeModule } from './modules/realtime/realtime.module';
 import { OnchainModule } from './modules/onchain/onchain.module';
 import { SpotModule } from './modules/spot/spot.module';
 import { ConvertModule } from './modules/convert/convert.module';
+import { UserUpdatesModule } from './modules/user-updates/user-updates.module';
 
 @Module({
   imports: [
@@ -47,6 +48,7 @@ import { ConvertModule } from './modules/convert/convert.module';
       },
     ]),
     ScheduleModule.forRoot(),
+    UserUpdatesModule,
     DatabaseModule,
     RedisModule,
     AuditModule,

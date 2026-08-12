@@ -26,6 +26,11 @@ export class OneInchSwapProviderService {
   private requestQueue: Promise<void> = Promise.resolve();
   private lastRequestAt = 0;
   private readonly spenderCache = new Map<number, { address: string; expiresAt: number }>();
+  private readonly spotPriceCache = new Map<number, {
+    value: Record<string, string>;
+    expiresAt: number;
+  }>();
+  private readonly spotPriceInflight = new Map<number, Promise<Record<string, string>>>();
 
   constructor(private readonly config: ConfigService) {}
 
@@ -69,6 +74,28 @@ export class OneInchSwapProviderService {
       dst: input.toTokenAddress,
       amount: input.amount,
     }, input.chainId);
+  }
+
+  async getSpotPrices(chainId?: number): Promise<Record<string, string>> {
+    this.assertEnabled();
+    const resolvedChainId = chainId ?? this.config.get<number>('ONEINCH_CHAIN_ID', 42161);
+    const cached = this.spotPriceCache.get(resolvedChainId);
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+    const inflight = this.spotPriceInflight.get(resolvedChainId);
+    if (inflight) return inflight;
+    const swapBase = new URL(this.config.getOrThrow<string>('ONEINCH_BASE_URL'));
+    const url = new URL(`/price/v1.1/${resolvedChainId}`, swapBase.origin);
+    const request = this.enqueueRequest(() => this.requestUrl<Record<string, string>>(url))
+      .then((value) => {
+        this.spotPriceCache.set(resolvedChainId, {
+          value,
+          expiresAt: Date.now() + this.config.get<number>('ONEINCH_PRICE_CACHE_MS', 5_000),
+        });
+        return value;
+      })
+      .finally(() => this.spotPriceInflight.delete(resolvedChainId));
+    this.spotPriceInflight.set(resolvedChainId, request);
+    return request;
   }
 
   async getSpender(chainId?: number): Promise<string> {
@@ -186,40 +213,41 @@ export class OneInchSwapProviderService {
       for (const [key, value] of Object.entries(params)) {
         url.searchParams.set(key, value);
       }
-
-      const maxRetries = this.config.get<number>('ONEINCH_MAX_RETRIES', 2);
-      for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-        await this.waitForRequestSlot();
-        const response = await fetch(url, {
-          headers: {
-            accept: 'application/json',
-            authorization: `Bearer ${this.config.getOrThrow<string>('ONEINCH_API_KEY')}`,
-          },
-        });
-        const body = await response.json().catch(() => ({}));
-        if (response.ok) {
-          return body as T;
-        }
-        if (response.status === HttpStatus.TOO_MANY_REQUESTS) {
-          const retryAfterMs = this.retryAfterMs(response.headers?.get?.('retry-after'));
-          if (attempt < maxRetries) {
-            await this.sleep(Math.max(retryAfterMs, 1_100 * 2 ** attempt));
-            continue;
-          }
-          throw new HttpException({
-            code: 'ONEINCH_RATE_LIMITED',
-            message: '1inch rate limit exceeded; retry later',
-            retryAfterSeconds: Math.max(1, Math.ceil(retryAfterMs / 1_000)),
-          }, HttpStatus.TOO_MANY_REQUESTS);
-        }
-        const message =
-          typeof body === 'object' && body && 'description' in body
-            ? String((body as { description: unknown }).description)
-            : `1inch returned HTTP ${response.status}`;
-        throw new ServiceUnavailableException(message);
-      }
-      throw new ServiceUnavailableException('1inch request failed');
+      return this.requestUrl<T>(url);
     });
+  }
+
+  private async requestUrl<T>(url: URL): Promise<T> {
+    const maxRetries = this.config.get<number>('ONEINCH_MAX_RETRIES', 2);
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      await this.waitForRequestSlot();
+      const response = await fetch(url, {
+        headers: {
+          accept: 'application/json',
+          authorization: `Bearer ${this.config.getOrThrow<string>('ONEINCH_API_KEY')}`,
+        },
+      });
+      const body = await response.json().catch(() => ({}));
+      if (response.ok) return body as T;
+      if (response.status === HttpStatus.TOO_MANY_REQUESTS) {
+        const retryAfterMs = this.retryAfterMs(response.headers?.get?.('retry-after'));
+        if (attempt < maxRetries) {
+          await this.sleep(Math.max(retryAfterMs, 1_100 * 2 ** attempt));
+          continue;
+        }
+        throw new HttpException({
+          code: 'ONEINCH_RATE_LIMITED',
+          message: '1inch rate limit exceeded; retry later',
+          retryAfterSeconds: Math.max(1, Math.ceil(retryAfterMs / 1_000)),
+        }, HttpStatus.TOO_MANY_REQUESTS);
+      }
+      const message =
+        typeof body === 'object' && body && 'description' in body
+          ? String((body as { description: unknown }).description)
+          : `1inch returned HTTP ${response.status}`;
+      throw new ServiceUnavailableException(message);
+    }
+    throw new ServiceUnavailableException('1inch request failed');
   }
 
   private enqueueRequest<T>(operation: () => Promise<T>): Promise<T> {

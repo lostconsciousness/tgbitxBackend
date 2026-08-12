@@ -239,6 +239,7 @@ enum CustodyAccountRole {
   DEPOSIT_TREASURY
   WITHDRAWAL_HOT
   SWEEP_GAS
+  SPOT_LIQUIDITY
   SAFE_RESERVE
   HYPERLIQUID_COLLATERAL
   PLATFORM_CAPITAL
@@ -548,6 +549,7 @@ model Network {
   updatedAt           DateTime              @updatedAt
   tokenContracts      TokenContract[]
   depositCursors      DepositIndexerCursor[]
+  tronDepositCursors  TronDepositScanCursor[]
 
   @@index([family, depositEnabled])
   @@index([family, withdrawalEnabled])
@@ -565,6 +567,7 @@ model TokenContract {
   withdrawalEnabled   Boolean                  @default(false)
   withdrawalFeeAmount Decimal                  @default(0) @db.Decimal(38, 18)
   minWithdrawalAmount Decimal                  @default(0) @db.Decimal(38, 18)
+  minDepositAmount    Decimal                  @default(0) @db.Decimal(38, 18)
   contractVerifiedAt  DateTime?
   contractCodeHash    String?
   verifiedChainId     Int?
@@ -779,6 +782,7 @@ model UserDepositAddress {
   user              User                     @relation(fields: [userId], references: [id], onDelete: Restrict)
   deposits          Deposit[]
   sweeps            DepositSweep[]
+  tronScanCursors   TronDepositScanCursor[]
 
   @@unique([userId, network])
   @@unique([network, address])
@@ -869,6 +873,24 @@ model DepositIndexerCursor {
 
   @@index([networkId, tokenContractId])
   @@map("deposit_indexer_cursors")
+}
+
+model TronDepositScanCursor {
+  id               String             @id @default(cuid())
+  key              String             @unique
+  networkId        String
+  depositAddressId String
+  stream           String
+  lastTimestampMs  BigInt             @default(0)
+  lastBlock        Int?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+  network          Network            @relation(fields: [networkId], references: [id], onDelete: Cascade)
+  depositAddress   UserDepositAddress @relation(fields: [depositAddressId], references: [id], onDelete: Cascade)
+
+  @@unique([depositAddressId, stream])
+  @@index([networkId, stream, updatedAt])
+  @@map("tron_deposit_scan_cursors")
 }
 
 model WithdrawalAddress {

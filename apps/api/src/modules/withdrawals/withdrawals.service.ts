@@ -1028,8 +1028,9 @@ export class WithdrawalsService {
         this.logger.error(`Withdrawal ${withdrawal.id} uses an unverified token contract`);
         continue;
       }
+      let hot: { address: string };
       try {
-        const hot = await this.getWithdrawalHotAccount(withdrawal.network);
+        hot = await this.getWithdrawalHotAccount(withdrawal.network);
         if (isEvm) {
           await this.custody.assertConfiguredWalletAddress(hot.address);
         }
@@ -1048,6 +1049,27 @@ export class WithdrawalsService {
           await this.failAndRelease(
             withdrawal.id,
             `Insufficient ${withdrawal.asset.symbol} custody on ${withdrawal.tokenContract.network.chainKey}: available ${liquidity.total.toString()} (hot ${liquidity.hot.toString()}, treasury ${liquidity.treasury.toString()}), requested ${withdrawal.amount.toString()}. Withdraw on a network where funds are custodied.`,
+          );
+          continue;
+        }
+      } else {
+        const liquidity = await this.nonEvm.getBalance({
+          network: withdrawal.tokenContract.network,
+          tokenContract: withdrawal.tokenContract,
+          address: hot.address,
+        });
+        if (liquidity.status !== 'AVAILABLE' || liquidity.balance === null) {
+          await this.deferApprovedWithdrawal(
+            withdrawal.id,
+            `Could not verify ${withdrawal.asset.symbol} hot-wallet balance on ${withdrawal.tokenContract.network.chainKey}`,
+          );
+          continue;
+        }
+        const available = new Prisma.Decimal(liquidity.balance);
+        if (available.lessThan(withdrawal.amount)) {
+          await this.failAndRelease(
+            withdrawal.id,
+            `Insufficient ${withdrawal.asset.symbol} hot-wallet custody on ${withdrawal.tokenContract.network.chainKey}: available ${available.toString()}, requested ${withdrawal.amount.toString()}.`,
           );
           continue;
         }
@@ -1230,6 +1252,13 @@ export class WithdrawalsService {
             amount: withdrawal.amount.toString(),
             requiredConfirmations: this.config.get<number>('WITHDRAWAL_CONFIRMATIONS', 12),
           });
+          if (result.failed) {
+            await this.failAndRelease(
+              withdrawal.id,
+              result.failureReason ?? 'Non-EVM transaction failed on-chain',
+            );
+            continue;
+          }
           if (!result.confirmed) {
             continue;
           }

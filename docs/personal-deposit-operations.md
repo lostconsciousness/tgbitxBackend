@@ -6,7 +6,11 @@ Create two policies and one server wallet:
 
 1. Deposit sweep policy: personal deposit wallets may only call verified
    ERC-20 `transfer(address,uint256)` contracts, with the active deposit
-   treasury as recipient and native value `0`.
+   treasury as recipient and native value `0`. BNB Chain uses Privy
+   `eth_signTransaction`, while the other EVM networks use
+   `eth_sendTransaction`; each method needs a separate token-specific rule.
+   Never add a chain-wide rule that permits arbitrary token contracts or
+   recipients.
 2. Sweep gas policy: the gas wallet may only send small native transfers to
    active personal deposit addresses and active deposit treasury addresses on
    enabled EVM networks. Treasury recipients are required so treasury-to-hot
@@ -26,6 +30,15 @@ SWEEP_GAS_TOPUP_WEI=
 SWEEP_GAS_MAX_TOPUP_WEI=
 DEPOSIT_ADDRESS_SCAN_BATCH_SIZE=100
 ```
+
+Apply the idempotent token-specific rules (currently BNB USDC, BNB USDT and
+Arbitrum USDT) with:
+
+```bash
+npm run privy:update-deposit-sweep-policy
+```
+
+The command updates existing matching rules and can be run again safely.
 
 Run `npm run seed` after configuring the gas wallet so the `SWEEP_GAS`
 custody account is registered. Check `GET /admin/onchain/readiness` before
