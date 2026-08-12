@@ -94,4 +94,11 @@ describe('ConvertOrderbookService', () => {
 
     expect(scaled.map((level: any) => level.size)).toEqual(['0.00004882', '0.00010000']);
   });
+
+  it('keeps symmetric six-decimal precision around the stablecoin peg', () => {
+    const { service } = createService();
+
+    expect((service as any).formatPrice(new Prisma.Decimal('1.000234'))).toBe('1.000234');
+    expect((service as any).formatPrice(new Prisma.Decimal('0.997995'))).toBe('0.997995');
+  });
 });

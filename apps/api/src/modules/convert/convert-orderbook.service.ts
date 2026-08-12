@@ -562,6 +562,10 @@ export class ConvertOrderbookService {
     const n = Number(price.toString());
     if (!Number.isFinite(n) || n <= 0) return price.toFixed(8);
     if (n >= 1000) return price.toFixed(1);
+    // Stablecoin crosses need symmetric sub-basis-point precision on both
+    // sides. Formatting 0.99… to 6 decimals but 1.00… to 4 collapsed most ask
+    // levels in the UI and made a 24-level book look like four rows.
+    if (n >= 0.9 && n <= 1.1) return price.toFixed(6);
     if (n >= 1) return price.toFixed(4);
     return price.toFixed(6);
   }
