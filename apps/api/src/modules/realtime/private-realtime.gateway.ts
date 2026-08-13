@@ -274,6 +274,7 @@ export class PrivateRealtimeGateway
         }),
         this.prisma.order.findMany({
           where: { userId },
+          include: { market: true, providerOrder: true, trades: true },
           orderBy: { createdAt: 'desc' },
           take: 50,
         }),

@@ -82,4 +82,43 @@ describe('PrivateRealtimeGateway payload serialization', () => {
     await update;
     expect(emit).toHaveBeenCalledWith('balances', [{ asset: 'USDC' }]);
   });
+
+  it('includes market metadata in the initial orders snapshot', async () => {
+    const emit = jest.fn();
+    const orderFindMany = jest.fn().mockResolvedValue([{
+      id: 'order-1',
+      market: { symbol: 'ETH-PERP', type: 'PERP' },
+    }]);
+    const gateway = new PrivateRealtimeGateway(
+      {} as JwtService,
+      { get: jest.fn().mockReturnValue('HYPERLIQUID') } as unknown as ConfigService,
+      {} as SessionsService,
+      {
+        getOverview: jest.fn().mockResolvedValue({ balances: [], portfolio: {} }),
+      } as unknown as AccountService,
+      {
+        deposit: { findMany: jest.fn().mockResolvedValue([]) },
+        withdrawal: { findMany: jest.fn().mockResolvedValue([]) },
+        order: { findMany: orderFindMany },
+        trade: { findMany: jest.fn().mockResolvedValue([]) },
+        liquidationEvent: { findMany: jest.fn().mockResolvedValue([]) },
+      } as unknown as PrismaService,
+      { isExecutionEnabled: jest.fn().mockReturnValue(true) } as unknown as HyperliquidExecutionService,
+      { listUserPositions: jest.fn().mockResolvedValue([]) } as unknown as PositionsService,
+      {} as UserUpdatesService,
+    );
+
+    await (gateway as unknown as {
+      emitSnapshot(client: { data: { userId: string }; connected: boolean; emit: typeof emit }): Promise<void>;
+    }).emitSnapshot({ data: { userId: 'user-1' }, connected: true, emit });
+
+    expect(orderFindMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { userId: 'user-1' },
+      include: { market: true, providerOrder: true, trades: true },
+    }));
+    expect(emit).toHaveBeenCalledWith('orders', [{
+      id: 'order-1',
+      market: { symbol: 'ETH-PERP', type: 'PERP' },
+    }]);
+  });
 });
