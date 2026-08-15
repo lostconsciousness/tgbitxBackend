@@ -605,9 +605,13 @@ export class ConvertService implements OnModuleInit {
     const reserveSymbol = ['SOL', 'TRX'].find((symbol) =>
       fromAsset.symbol === symbol || toAsset.symbol === symbol,
     );
-    const quote = reserveSymbol
-      ? await this.quoteNativeReserve(reserveSymbol, fromAsset, toAsset, amount, slippageBps)
-      : await this.quoteOneInch(fromAsset, toAsset, amount, slippageBps);
+    const stableReserve = ['USDC', 'USDT'].includes(fromAsset.symbol) &&
+      ['USDC', 'USDT'].includes(toAsset.symbol);
+    const quote = stableReserve
+      ? await this.quoteStableReserve(fromAsset, toAsset, amount, slippageBps)
+      : reserveSymbol
+        ? await this.quoteNativeReserve(reserveSymbol, fromAsset, toAsset, amount, slippageBps)
+        : await this.quoteOneInch(fromAsset, toAsset, amount, slippageBps);
 
     await this.assertOrderLimits(userId, fromAsset, toAsset, amount, quote.expectedToAmount);
     const ttlSeconds = this.config.get<number>('CONVERT_QUOTE_TTL_SECONDS', 20);
@@ -1070,6 +1074,58 @@ export class ConvertService implements OnModuleInit {
         priceTime: book.time,
       },
     };
+  }
+
+  private async quoteStableReserve(
+    fromAsset: any,
+    toAsset: any,
+    amount: Prisma.Decimal,
+    slippageBps: number,
+  ) {
+    const routes = this.evmRoutes(fromAsset, toAsset);
+    if (routes.length === 0) {
+      throw new BadRequestException(
+        `${fromAsset.symbol}/${toAsset.symbol} has no common verified reference network`,
+      );
+    }
+    const failures: string[] = [];
+    for (const route of routes) {
+      try {
+        const fromRaw = parseUnits(amount.toFixed(route.fromDecimals), route.fromDecimals);
+        const response = await this.oneInch.quoteExactInput({
+          fromTokenAddress: route.fromToken,
+          toTokenAddress: route.toToken,
+          amount: fromRaw.toString(),
+          chainId: route.chainId,
+        });
+        const gross = new Prisma.Decimal(formatUnits(BigInt(response.dstAmount), route.toDecimals));
+        const fee = gross.mul(this.config.get<number>('CONVERT_FEE_BPS', 20)).div(10_000);
+        const expected = gross.minus(fee);
+        const min = gross.mul(new Prisma.Decimal(10_000 - slippageBps)).div(10_000).minus(fee);
+        await this.assertReserveCoverage(toAsset, gross);
+        return {
+          provider: ConversionProvider.INTERNAL_RESERVE,
+          networkKey: route.networkKey,
+          expectedToAmount: expected,
+          minToAmount: min,
+          feeAmount: fee,
+          providerData: {
+            referenceProvider: 'ONEINCH',
+            referenceNetwork: route.networkKey,
+            referenceGrossAmount: gross.toString(),
+            fromDecimals: route.fromDecimals,
+            toDecimals: route.toDecimals,
+          },
+        };
+      } catch (error) {
+        failures.push(`${route.networkKey}: ${this.safeError(error)}`);
+      }
+    }
+    throw new ServiceUnavailableException({
+      code: 'CONVERT_STABLE_RESERVE_UNAVAILABLE',
+      message: 'Stablecoin reserve conversion is currently unavailable',
+      routes: failures,
+    });
   }
 
   private async quoteOneInch(fromAsset: any, toAsset: any, amount: Prisma.Decimal, slippageBps: number) {

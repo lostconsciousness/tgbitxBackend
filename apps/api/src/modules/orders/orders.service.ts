@@ -2195,6 +2195,7 @@ export class OrdersService {
     },
   ) {
     const notional = input.size.mul(input.price);
+    let feeSettledWithClose = new Prisma.Decimal(0);
     if (input.reduceOnly) {
       await this.closePositionWithFill(tx, input, notional);
     } else {
@@ -2209,57 +2210,100 @@ export class OrdersService {
         },
       });
       if (existing && existing.side !== side) {
-        throw new BadRequestException('Close the opposite position first');
-      }
-      const totalSize = new Prisma.Decimal(existing?.size ?? 0).plus(input.size);
-      const weightedEntry = existing
-        ? new Prisma.Decimal(existing.entryPrice)
-            .mul(existing.size)
-            .plus(input.price.mul(input.size))
-            .div(totalSize)
-        : input.price;
-      const totalMargin = new Prisma.Decimal(existing?.margin ?? 0).plus(input.margin);
-      const maintenance = totalSize.mul(weightedEntry).mul(input.maintenanceRate);
-      const liquidationPrice = this.calculateLiquidationPrice(
-        side,
-        weightedEntry,
-        input.leverage,
-        input.maintenanceRate,
-      );
-      if (existing) {
-        await tx.position.update({
-          where: { id: existing.id },
-          data: {
-            size: totalSize,
-            entryPrice: weightedEntry,
-            markPrice: input.price,
-            margin: totalMargin,
-            maintenanceMargin: maintenance,
-            liquidationPrice,
-          },
-        });
+        const closeSize = Prisma.Decimal.min(input.size, existing.size);
+        const closeRatio = closeSize.div(input.size);
+        const closeFee = input.fee.mul(closeRatio);
+        const closeOrderMargin = input.margin.mul(closeRatio);
+        await this.closePositionWithFill(tx, {
+          ...input,
+          size: closeSize,
+          fee: closeFee,
+          settlement: undefined,
+        }, closeSize.mul(input.price));
+        await this.releaseNettedOrderMargin(tx, input, closeOrderMargin);
+        feeSettledWithClose = closeFee;
+
+        const residualSize = input.size.minus(closeSize);
+        if (residualSize.greaterThan(0)) {
+          const residualMargin = input.margin.minus(closeOrderMargin);
+          const residualNotional = residualSize.mul(input.price);
+          const maintenance = residualNotional.mul(input.maintenanceRate);
+          await tx.position.create({
+            data: {
+              userId: input.userId,
+              marketId: input.marketId,
+              side,
+              route: input.route,
+              size: residualSize,
+              entryPrice: input.price,
+              markPrice: input.price,
+              leverage: input.leverage,
+              margin: residualMargin,
+              maintenanceMargin: maintenance,
+              liquidationPrice: this.calculateLiquidationPrice(
+                side,
+                input.price,
+                input.leverage,
+                input.maintenanceRate,
+              ),
+            },
+          });
+          if (input.route === ExecutionRoute.B_BOOK_INTERNAL) {
+            await this.updateExposure(tx, input.marketId, side, residualNotional);
+          }
+        }
       } else {
-        await tx.position.create({
-          data: {
-            userId: input.userId,
-            marketId: input.marketId,
-            side,
-            route: input.route,
-            size: input.size,
-            entryPrice: input.price,
-            markPrice: input.price,
-            leverage: input.leverage,
-            margin: input.margin,
-            maintenanceMargin: maintenance,
-            liquidationPrice,
-          },
-        });
-      }
-      if (input.route === ExecutionRoute.B_BOOK_INTERNAL) {
-        await this.updateExposure(tx, input.marketId, side, notional);
+        const totalSize = new Prisma.Decimal(existing?.size ?? 0).plus(input.size);
+        const weightedEntry = existing
+          ? new Prisma.Decimal(existing.entryPrice)
+              .mul(existing.size)
+              .plus(input.price.mul(input.size))
+              .div(totalSize)
+          : input.price;
+        const totalMargin = new Prisma.Decimal(existing?.margin ?? 0).plus(input.margin);
+        const maintenance = totalSize.mul(weightedEntry).mul(input.maintenanceRate);
+        const liquidationPrice = this.calculateLiquidationPrice(
+          side,
+          weightedEntry,
+          input.leverage,
+          input.maintenanceRate,
+        );
+        if (existing) {
+          await tx.position.update({
+            where: { id: existing.id },
+            data: {
+              size: totalSize,
+              entryPrice: weightedEntry,
+              markPrice: input.price,
+              margin: totalMargin,
+              maintenanceMargin: maintenance,
+              liquidationPrice,
+            },
+          });
+        } else {
+          await tx.position.create({
+            data: {
+              userId: input.userId,
+              marketId: input.marketId,
+              side,
+              route: input.route,
+              size: input.size,
+              entryPrice: input.price,
+              markPrice: input.price,
+              leverage: input.leverage,
+              margin: input.margin,
+              maintenanceMargin: maintenance,
+              liquidationPrice,
+            },
+          });
+        }
+        if (input.route === ExecutionRoute.B_BOOK_INTERNAL) {
+          await this.updateExposure(tx, input.marketId, side, notional);
+        }
       }
     }
-    if (!input.reduceOnly && input.fee.greaterThan(0)) {
+    const openingFee = input.fee.minus(feeSettledWithClose);
+    if (!input.reduceOnly && openingFee.greaterThan(0)) {
       await this.ledger.postTransaction({
         type: LedgerTransactionType.TRADING_FEE,
         idempotencyKey: `order-fee:${input.providerFillId ?? input.orderId}`,
@@ -2271,13 +2315,13 @@ export class OrdersService {
             userId: input.userId,
             assetId: input.quoteAssetId,
             direction: LedgerEntryDirection.DEBIT,
-            amount: input.fee,
+            amount: openingFee,
           },
           {
             accountType: LedgerAccountType.PLATFORM_FEES,
             assetId: input.quoteAssetId,
             direction: LedgerEntryDirection.CREDIT,
-            amount: input.fee,
+            amount: openingFee,
           },
         ],
       }, tx);
@@ -2325,6 +2369,42 @@ export class OrdersService {
         },
       });
     }
+  }
+
+  private async releaseNettedOrderMargin(
+    tx: Prisma.TransactionClient,
+    input: {
+      orderId: string;
+      userId: string;
+      quoteAssetId: string;
+      providerFillId?: string;
+    },
+    amount: Prisma.Decimal,
+  ): Promise<void> {
+    if (amount.lessThanOrEqualTo(0)) return;
+    await this.ledger.postTransaction({
+      type: LedgerTransactionType.MARGIN_RELEASE,
+      idempotencyKey: `netted-order-margin-release:${input.providerFillId ?? input.orderId}`,
+      referenceType: 'Order',
+      referenceId: input.orderId,
+      description: 'Release margin reserved by an order that reduced an opposite position',
+      entries: [
+        {
+          accountType: LedgerAccountType.USER_PERP_MARGIN,
+          userId: input.userId,
+          assetId: input.quoteAssetId,
+          direction: LedgerEntryDirection.DEBIT,
+          amount,
+        },
+        {
+          accountType: LedgerAccountType.USER_SPOT,
+          userId: input.userId,
+          assetId: input.quoteAssetId,
+          direction: LedgerEntryDirection.CREDIT,
+          amount,
+        },
+      ],
+    }, tx);
   }
 
   private async closePositionWithFill(

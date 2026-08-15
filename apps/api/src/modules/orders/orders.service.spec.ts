@@ -548,6 +548,91 @@ describe('OrdersService omnibus close netting', () => {
       update: { value: '0.00003' },
     });
   });
+
+  it('nets a filled opposite-side provider order into the existing user position', async () => {
+    const position = {
+      id: 'position-eth-short',
+      userId: 'user-icloud',
+      marketId: 'market-eth-perp',
+      route: ExecutionRoute.A_BOOK_HYPERLIQUID,
+      side: PositionSide.SHORT,
+      size: new Prisma.Decimal('0.3366'),
+      entryPrice: new Prisma.Decimal('1882.5'),
+      margin: new Prisma.Decimal('63.32'),
+    };
+    const order = {
+      id: 'order-buy-eth',
+      size: new Prisma.Decimal('0.2652'),
+      filledSize: new Prisma.Decimal(0),
+      averageFillPrice: null,
+    };
+    const tx = {
+      position: {
+        findFirst: jest.fn().mockResolvedValue(position),
+        update: jest.fn().mockResolvedValue(position),
+        create: jest.fn(),
+      },
+      order: {
+        findUniqueOrThrow: jest.fn().mockResolvedValue(order),
+        update: jest.fn().mockResolvedValue(order),
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+      },
+      trade: { create: jest.fn().mockResolvedValue({}) },
+    };
+    const ledger = {
+      postTransaction: jest.fn().mockImplementation(async (posting: { idempotencyKey: string }) => ({
+        id: posting.idempotencyKey,
+      })),
+    };
+    const service = new OrdersService(
+      {} as PrismaService,
+      {} as ConfigService,
+      {} as MarketsService,
+      {} as MarketDataService,
+      {} as RoutingService,
+      ledger as unknown as LedgerService,
+      {} as HyperliquidExecutionService,
+      {} as OperationalSettingsService,
+    );
+
+    await (service as unknown as {
+      applyFill: (client: typeof tx, input: Record<string, unknown>) => Promise<void>;
+    }).applyFill(tx, {
+      orderId: order.id,
+      userId: position.userId,
+      marketId: position.marketId,
+      quoteAssetId: 'asset-usdc',
+      side: OrderSide.BUY,
+      route: ExecutionRoute.A_BOOK_HYPERLIQUID,
+      size: new Prisma.Decimal('0.2652'),
+      price: new Prisma.Decimal('1882.49'),
+      margin: new Prisma.Decimal('49.75'),
+      leverage: 10,
+      fee: new Prisma.Decimal('0.1'),
+      maintenanceRate: new Prisma.Decimal('0.005'),
+      reduceOnly: false,
+      providerFillId: 'provider-fill-netting',
+    });
+
+    expect(tx.position.update).toHaveBeenCalledWith({
+      where: { id: position.id },
+      data: expect.objectContaining({
+        size: expect.objectContaining({ s: 1 }),
+        margin: expect.any(Prisma.Decimal),
+      }),
+    });
+    const positionUpdate = tx.position.update.mock.calls[0][0].data;
+    expect(positionUpdate.size.equals('0.0714')).toBe(true);
+    expect(tx.position.create).not.toHaveBeenCalled();
+    expect(ledger.postTransaction.mock.calls.map(([posting]) => posting.idempotencyKey)).toEqual([
+      'position-close:provider-fill-netting',
+      'netted-order-margin-release:provider-fill-netting',
+    ]);
+    expect(tx.order.update).toHaveBeenCalledWith({
+      where: { id: order.id },
+      data: expect.objectContaining({ status: OrderStatus.FILLED }),
+    });
+  });
 });
 
 describe('OrdersService spot orders', () => {

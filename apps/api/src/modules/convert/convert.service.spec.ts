@@ -259,6 +259,44 @@ describe('ConvertService quotes', () => {
     expect(quote.networkKey).toBe('tron');
   });
 
+  it('quotes USDT/USDC against aggregate reserves without requiring EVM source inventory', async () => {
+    const { instance, oneInch } = service();
+    oneInch.quoteExactInput.mockResolvedValueOnce({ dstAmount: '51900000' });
+    const network = { chainKey: 'arbitrum', chainId: 42161, mainnet: true };
+    const contract = (address: string) => ({
+      address,
+      decimals: 6,
+      standard: TokenStandard.ERC20,
+      contractVerifiedAt: new Date(),
+      network,
+    });
+
+    const quote = await (instance as any).quoteStableReserve(
+      {
+        id: 'usdt',
+        symbol: 'USDT',
+        decimals: 6,
+        tokenContracts: [contract('0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9')],
+      },
+      {
+        id: 'usdc',
+        symbol: 'USDC',
+        decimals: 6,
+        tokenContracts: [contract('0xaf88d065e77c8cc2239327c5edb3a432268e5831')],
+      },
+      new Prisma.Decimal('52'),
+      50,
+    );
+
+    expect(quote.provider).toBe(ConversionProvider.INTERNAL_RESERVE);
+    expect(quote.networkKey).toBe('arbitrum');
+    expect(quote.expectedToAmount.toString()).toBe('51.7962');
+    expect(oneInch.quoteExactInput).toHaveBeenCalledWith(expect.objectContaining({
+      amount: '52000000',
+      chainId: 42161,
+    }));
+  });
+
   it('uses verified Arbitrum contracts for exact-input 1inch quotes', async () => {
     const { instance, oneInch } = service();
     const network = { chainKey: 'arbitrum', chainId: 42161, mainnet: true };
