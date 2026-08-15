@@ -297,6 +297,51 @@ describe('ConvertService quotes', () => {
     }));
   });
 
+  it('aggregates unique active custody addresses for reserve coverage', async () => {
+    const network = { chainKey: 'arbitrum', legacyChain: 'ARBITRUM', mainnet: true };
+    const prisma = {
+      custodyAccount: {
+        findMany: jest.fn().mockResolvedValue([
+          { address: '0x0000000000000000000000000000000000000001', network: 'ARBITRUM' },
+          { address: '0x0000000000000000000000000000000000000002', network: 'ARBITRUM' },
+          { address: '0x0000000000000000000000000000000000000002', network: 'ARBITRUM' },
+        ]),
+      },
+    };
+    const custody = {
+      getWalletAddress: jest.fn().mockResolvedValue('0x0000000000000000000000000000000000000001'),
+      isTronEnabled: jest.fn().mockReturnValue(false),
+    };
+    const rpc = {
+      getBalance: jest.fn().mockImplementation(async (wallet: string) => ({
+        value: wallet.endsWith('1') ? '10' : '20',
+      })),
+    };
+    const instance = new ConvertService(
+      prisma as any,
+      config,
+      {} as any,
+      {} as any,
+      {} as any,
+      custody as any,
+      rpc as any,
+      undefined,
+    );
+    const total = await (instance as any).getAggregateEvmBalance({
+      symbol: 'USDC',
+      tokenContracts: [{
+        address: '0xaf88d065e77c8cc2239327c5edb3a432268e5831',
+        decimals: 6,
+        standard: TokenStandard.ERC20,
+        contractVerifiedAt: new Date(),
+        network,
+      }],
+    });
+
+    expect(total.toString()).toBe('30');
+    expect(rpc.getBalance).toHaveBeenCalledTimes(2);
+  });
+
   it('uses verified Arbitrum contracts for exact-input 1inch quotes', async () => {
     const { instance, oneInch } = service();
     const network = { chainKey: 'arbitrum', chainId: 42161, mainnet: true };

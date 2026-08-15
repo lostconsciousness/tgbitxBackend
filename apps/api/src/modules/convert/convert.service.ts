@@ -12,9 +12,12 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { Interval } from '@nestjs/schedule';
 import {
+  Chain,
   ConversionProvider,
   ConversionQuoteStatus,
   ConversionStatus,
+  CustodyAccountRole,
+  CustodyAccountStatus,
   LedgerAccountType,
   LedgerEntryDirection,
   LedgerTransactionType,
@@ -1516,15 +1519,43 @@ export class ConvertService implements OnModuleInit {
   }
 
   private async getAggregateEvmBalance(asset: any): Promise<Prisma.Decimal> {
-    const wallet = await this.custody.getWalletAddress();
     const contracts = asset.tokenContracts.filter((item: any) => this.isVerifiedEvmContract(item));
-    const requests: Array<Promise<Prisma.Decimal>> = contracts.map((contract: any) =>
-      this.getEvmBalance(
+    const legacyChains: Chain[] = [...new Set<Chain>(
+      contracts.flatMap((contract: any) =>
+        contract.network.legacyChain ? [contract.network.legacyChain as Chain] : []),
+    )];
+    const [defaultWallet, custodyAccounts] = await Promise.all([
+      this.custody.getWalletAddress(),
+      this.prisma.custodyAccount.findMany({
+        where: {
+          status: CustodyAccountStatus.ACTIVE,
+          network: { in: legacyChains },
+          role: {
+            in: [
+              CustodyAccountRole.DEPOSIT_TREASURY,
+              CustodyAccountRole.WITHDRAWAL_HOT,
+              CustodyAccountRole.SPOT_LIQUIDITY,
+              CustodyAccountRole.SAFE_RESERVE,
+            ],
+          },
+        },
+        select: { address: true, network: true },
+      }),
+    ]);
+    const requests: Array<Promise<Prisma.Decimal>> = contracts.flatMap((contract: any) => {
+      const addresses = new Set<string>([defaultWallet.toLowerCase()]);
+      for (const account of custodyAccounts) {
+        if (account.network === contract.network.legacyChain) {
+          addresses.add(account.address.toLowerCase());
+        }
+      }
+      return [...addresses].map((wallet) => this.getEvmBalance(
         wallet,
         contract.standard === TokenStandard.NATIVE ? undefined : contract.address,
         contract.network.chainKey,
         contract.decimals,
       ));
+    });
     if (
       ['USDC', 'USDT'].includes(asset.symbol) &&
       this.custody.isTronEnabled() &&
