@@ -106,14 +106,19 @@ function usdtSweepRule(treasuryAddress: string): DesiredRule {
       },
       {
         field_source: 'tron_trigger_smart_contract_data',
-        field: 'transfer.to',
+        field: 'transfer._to',
         operator: 'eq',
         value: treasuryAddress,
         abi: [
           {
             name: 'transfer',
             type: 'function',
-            inputs: [{ name: 'to', type: 'address' }],
+            stateMutability: 'nonpayable',
+            inputs: [
+              { name: '_to', type: 'address' },
+              { name: '_value', type: 'uint256' },
+            ],
+            outputs: [{ name: '', type: 'bool' }],
           },
         ],
       },
