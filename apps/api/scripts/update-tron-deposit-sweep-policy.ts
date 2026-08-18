@@ -105,12 +105,6 @@ function usdtSweepRule(treasuryAddress: string): DesiredRule {
         value: TRON_USDT_CONTRACT,
       },
       {
-        field_source: 'tron_transaction',
-        field: 'TriggerSmartContract.call_value',
-        operator: 'eq',
-        value: '0',
-      },
-      {
         field_source: 'tron_trigger_smart_contract_data',
         field: 'transfer.to',
         operator: 'eq',
