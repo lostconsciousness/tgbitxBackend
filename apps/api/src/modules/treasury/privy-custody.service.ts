@@ -26,14 +26,6 @@ type PrivyReadClient = {
       walletId: string,
       input: Record<string, unknown>,
     ): Promise<{ method: string; data: { hash: string; transaction_id?: string } }>;
-    rawSign(
-      walletId: string,
-      input: {
-        params: { bytes: string; encoding: 'hex'; hash_function: 'sha256' };
-        idempotency_key: string;
-        authorization_context: { authorization_private_keys: string[] };
-      },
-    ): Promise<{ signature: string }>;
     ethereum(): {
       signTransaction(
         walletId: string,
@@ -122,6 +114,10 @@ type TronUnsignedTransaction = {
       parameter?: { value?: Record<string, unknown> };
     }>;
     fee_limit?: number;
+    expiration?: number;
+    ref_block_bytes?: string;
+    ref_block_hash?: string;
+    timestamp?: number;
   };
   signature?: string[];
 };
@@ -413,40 +409,79 @@ export class PrivyCustodyService {
         input.transaction.raw_data_hex.length % 2 !== 0) {
       throw new ServiceUnavailableException('Tron transaction raw_data_hex is missing or invalid');
     }
-    const response = await client.wallets().rawSign(walletId, {
+    const tronWeb = input.tronWeb ?? await this.createTronWebClient(input.mainnet !== false);
+    const rawData = this.toPrivyTronRawData(input.transaction, input.fromAddress, tronWeb);
+    const response = await client.wallets().rpc(walletId, {
+      method: 'tron_sendTransaction',
       params: {
-        bytes: input.transaction.raw_data_hex,
-        encoding: 'hex',
-        hash_function: 'sha256',
+        raw_data: rawData,
+        reference_id: input.referenceId,
       },
-      idempotency_key: `${input.referenceId}:raw-sign`,
+      idempotency_key: `${input.referenceId}:send`,
       authorization_context: {
         authorization_private_keys: [this.getAuthorizationPrivateKey()],
       },
     });
-    const tronWeb = input.tronWeb ?? await this.createTronWebClient(input.mainnet !== false);
-    const signature = this.normalizeTronSignature({
-      signature: response.signature,
-      transaction: input.transaction,
-      expectedAddress: input.fromAddress,
-      tronWeb,
-    });
-    const signedTransaction = { ...input.transaction, signature: [signature] };
-    const broadcast = await tronWeb.trx.sendRawTransaction(signedTransaction);
-    if (!broadcast?.result) {
-      const message = this.decodeTronMessage(broadcast?.message);
-      if (!/DUP_TRANSACTION/i.test(String(broadcast?.code ?? message))) {
-        throw new ServiceUnavailableException(
-          `Tron transaction broadcast failed${message ? `: ${message}` : ''}`,
-        );
-      }
-    }
-    const txHash = broadcast?.txid ?? broadcast?.transaction?.txID ?? input.transaction.txID;
+    const txHash = response.data.hash;
     if (!txHash || !/^[0-9a-f]{64}$/i.test(txHash)) {
-      throw new ServiceUnavailableException('Tron broadcast did not return a valid transaction hash');
+      throw new ServiceUnavailableException('Privy Tron broadcast did not return a valid transaction hash');
     }
     return {
       txHash,
+      providerRequestId: response.data.transaction_id,
+    };
+  }
+
+  private toPrivyTronRawData(
+    transaction: TronUnsignedTransaction,
+    expectedOwner: string,
+    tronWeb: any,
+  ): Record<string, unknown> {
+    const contract = transaction.raw_data.contract;
+    if (contract.length !== 1 || !contract[0]?.parameter?.value) {
+      throw new ServiceUnavailableException('Expected one Tron contract transaction');
+    }
+    const type = contract[0].type;
+    const value = contract[0].parameter.value;
+    const ownerAddress = String(value.owner_address ?? '');
+    if (ownerAddress.toLowerCase() !== String(tronWeb.address.toHex(expectedOwner)).toLowerCase()) {
+      throw new ServiceUnavailableException('Tron transaction owner does not match Privy wallet');
+    }
+    let privyContract: Record<string, unknown>;
+    let data: string | undefined;
+    if (type === 'TransferContract') {
+      privyContract = {
+        type,
+        owner_address: ownerAddress,
+        to_address: String(value.to_address ?? ''),
+        amount: Number(value.amount),
+      };
+    } else if (type === 'TriggerSmartContract') {
+      privyContract = {
+        type,
+        owner_address: ownerAddress,
+        contract_address: String(value.contract_address ?? ''),
+        ...(value.call_token_value !== undefined
+          ? { call_token_value: Number(value.call_token_value) }
+          : {}),
+        ...(value.token_id !== undefined ? { token_id: Number(value.token_id) } : {}),
+      };
+      data = String(value.data ?? '');
+      if (!/^[0-9a-f]+$/i.test(data)) {
+        throw new ServiceUnavailableException('Tron smart contract calldata is invalid');
+      }
+    } else {
+      throw new ServiceUnavailableException(`Unsupported Tron contract type: ${type}`);
+    }
+    const rawData = transaction.raw_data;
+    return {
+      contract: [privyContract],
+      ...(data ? { data } : {}),
+      ...(rawData.fee_limit !== undefined ? { fee_limit: rawData.fee_limit } : {}),
+      ...(rawData.expiration !== undefined ? { expiration: rawData.expiration } : {}),
+      ...(rawData.ref_block_bytes ? { ref_block_bytes: rawData.ref_block_bytes } : {}),
+      ...(rawData.ref_block_hash ? { ref_block_hash: rawData.ref_block_hash } : {}),
+      ...(rawData.timestamp !== undefined ? { timestamp: rawData.timestamp } : {}),
     };
   }
 
@@ -898,47 +933,4 @@ export class PrivyCustodyService {
     }
   }
 
-  private normalizeTronSignature(input: {
-    signature: string;
-    transaction: TronUnsignedTransaction;
-    expectedAddress: string;
-    tronWeb: any;
-  }): string {
-    const raw = input.signature.replace(/^0x/i, '').toLowerCase();
-    if (!/^[0-9a-f]+$/.test(raw)) {
-      throw new ServiceUnavailableException('Privy returned a non-hex Tron signature');
-    }
-    const candidates = raw.length === 128
-      ? [`${raw}1b`, `${raw}1c`]
-      : raw.length === 130
-        ? [
-            raw.endsWith('00') ? `${raw.slice(0, -2)}1b` : raw,
-            raw.endsWith('01') ? `${raw.slice(0, -2)}1c` : raw,
-          ]
-        : [];
-    for (const candidate of [...new Set(candidates)]) {
-      if (!/^[0-9a-f]{130}$/.test(candidate)) continue;
-      try {
-        const recovered = input.tronWeb.trx.ecRecover({
-          ...input.transaction,
-          signature: [candidate],
-        });
-        if (recovered === input.expectedAddress) {
-          return candidate;
-        }
-      } catch (_error) {
-        continue;
-      }
-    }
-    throw new ServiceUnavailableException('Privy Tron signature does not match wallet address');
-  }
-
-  private decodeTronMessage(value: unknown): string {
-    if (typeof value !== 'string' || !value) return '';
-    try {
-      return Buffer.from(value.replace(/^0x/i, ''), 'hex').toString('utf8');
-    } catch (_error) {
-      return value;
-    }
-  }
 }

@@ -66,7 +66,7 @@ type PrivyRule = {
 
 type DesiredRule = {
   name: string;
-  method: 'signTransactionBytes';
+  method: 'tron_sendTransaction';
   conditions: Array<PrivyCondition & { abi?: Array<Record<string, unknown>> }>;
   action: 'ALLOW';
 };
@@ -74,7 +74,7 @@ type DesiredRule = {
 function nativeSweepRule(treasuryAddress: string): DesiredRule {
   return {
     name: 'TRON native sweep to treasury (raw sign)',
-    method: 'signTransactionBytes',
+    method: 'tron_sendTransaction',
     conditions: [
       {
         field_source: 'tron_transaction',
@@ -96,7 +96,7 @@ function nativeSweepRule(treasuryAddress: string): DesiredRule {
 function usdtSweepRule(treasuryAddress: string): DesiredRule {
   return {
     name: 'TRON USDT sweep to treasury (raw sign)',
-    method: 'signTransactionBytes',
+    method: 'tron_sendTransaction',
     conditions: [
       {
         field_source: 'tron_transaction',

@@ -394,9 +394,13 @@ describe('PrivyCustodyService', () => {
     );
   });
 
-  it('raw-signs the complete Tron transaction and broadcasts it without dropping calldata', async () => {
-    const rawSign = jest.fn().mockResolvedValue({
-      signature: `0x${'11'.repeat(64)}`,
+  it('sends a validated structured Tron transaction through Privy', async () => {
+    const rpc = jest.fn().mockResolvedValue({
+      method: 'tron_sendTransaction',
+      data: {
+        hash: 'a'.repeat(64),
+        transaction_id: 'privy-tron-1',
+      },
     });
     const service = new PrivyCustodyService({
       get: jest.fn((key: string, fallback?: unknown) => {
@@ -427,7 +431,7 @@ describe('PrivyCustodyService', () => {
         wallets() {
           return {
             get: jest.fn().mockResolvedValue({ address: 'TFrom' }),
-            rawSign,
+            rpc,
           };
         }
       },
@@ -435,8 +439,8 @@ describe('PrivyCustodyService', () => {
     (service as any).createTronWebClient = jest.fn().mockResolvedValue({
       trx: {
         ecRecover: jest.fn().mockReturnValue('TFrom'),
-        sendRawTransaction: jest.fn().mockResolvedValue({ result: true, txid: 'a'.repeat(64) }),
       },
+      address: { toHex: jest.fn().mockReturnValue('41owner') },
       transactionBuilder: {
         sendTrx: jest.fn().mockResolvedValue({
           txID: 'a'.repeat(64),
@@ -466,18 +470,26 @@ describe('PrivyCustodyService', () => {
       mainnet: true,
     });
 
-    expect(rawSign).toHaveBeenCalledWith(
+    expect(rpc).toHaveBeenCalledWith(
       'tron-wallet-id',
       expect.objectContaining({
-        params: expect.objectContaining({
-          bytes: 'aabb',
-          encoding: 'hex',
-          hash_function: 'sha256',
-        }),
+        method: 'tron_sendTransaction',
+        params: {
+          raw_data: {
+            contract: [{
+              type: 'TransferContract',
+              owner_address: '41owner',
+              to_address: '41to',
+              amount: 1000,
+            }],
+          },
+          reference_id: 'withdrawal:tron-1',
+        },
       }),
     );
     expect(result).toEqual({
       txHash: 'a'.repeat(64),
+      providerRequestId: 'privy-tron-1',
     });
   });
 
@@ -511,6 +523,34 @@ describe('PrivyCustodyService', () => {
     })).not.toThrow();
   });
 
+  it('maps TronWeb TRC20 data to the structured Privy RPC schema', () => {
+    const service = new PrivyCustodyService({} as ConfigService);
+    expect((service as any).toPrivyTronRawData({
+      raw_data_hex: 'aabb',
+      raw_data: {
+        contract: [{
+          type: 'TriggerSmartContract',
+          parameter: { value: {
+            owner_address: `41${'11'.repeat(20)}`,
+            contract_address: `41${'33'.repeat(20)}`,
+            data: 'a9059cbb' + '00'.repeat(64),
+          } },
+        }],
+        fee_limit: 35_000_000,
+      },
+    }, 'TFrom', {
+      address: { toHex: jest.fn().mockReturnValue(`41${'11'.repeat(20)}`) },
+    })).toEqual({
+      contract: [{
+        type: 'TriggerSmartContract',
+        owner_address: `41${'11'.repeat(20)}`,
+        contract_address: `41${'33'.repeat(20)}`,
+      }],
+      data: 'a9059cbb' + '00'.repeat(64),
+      fee_limit: 35_000_000,
+    });
+  });
+
   it('rejects missing Tron TRC20 calldata before signing', () => {
     const service = new PrivyCustodyService({} as ConfigService);
     expect(() => (service as any).assertTronTrc20Transfer({
@@ -539,16 +579,6 @@ describe('PrivyCustodyService', () => {
     })).toThrow('calldata is missing or malformed');
   });
 
-  it('rejects a Tron signature that cannot recover the expected wallet', () => {
-    const service = new PrivyCustodyService({} as ConfigService);
-    expect(() => (service as any).normalizeTronSignature({
-      signature: `0x${'11'.repeat(64)}`,
-      transaction: { raw_data_hex: 'aabb', raw_data: { contract: [] } },
-      expectedAddress: 'TFrom',
-      tronWeb: { trx: { ecRecover: jest.fn().mockReturnValue('TOther') } },
-    })).toThrow('signature does not match wallet address');
-  });
-
   it('rejects a malformed Tron smart-contract call instead of signing it', () => {
     const service = new PrivyCustodyService({} as ConfigService);
     expect(() => (service as any).assertTronTrc20Transfer({
@@ -561,7 +591,7 @@ describe('PrivyCustodyService', () => {
     })).toThrow('Expected one Tron TriggerSmartContract transaction');
   });
 
-  it('rejects non-zero Tron call_value before raw signing', () => {
+  it('rejects non-zero Tron call_value before Privy submission', () => {
     const service = new PrivyCustodyService({} as ConfigService);
     expect(() => (service as any).assertTronTrc20Transfer({
       transaction: {
