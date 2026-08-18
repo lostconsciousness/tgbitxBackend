@@ -73,7 +73,7 @@ type DesiredRule = {
 
 function nativeSweepRule(treasuryAddress: string): DesiredRule {
   return {
-    name: 'TRON native sweep to treasury (raw sign)',
+    name: 'TRON native sweep to treasury',
     method: 'tron_sendTransaction',
     conditions: [
       {
@@ -95,7 +95,7 @@ function nativeSweepRule(treasuryAddress: string): DesiredRule {
 
 function usdtSweepRule(treasuryAddress: string): DesiredRule {
   return {
-    name: 'TRON USDT sweep to treasury (raw sign)',
+    name: 'TRON USDT sweep to treasury',
     method: 'tron_sendTransaction',
     conditions: [
       {
