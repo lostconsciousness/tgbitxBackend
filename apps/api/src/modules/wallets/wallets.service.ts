@@ -43,7 +43,7 @@ export class WalletsService {
 
   async listUserWallets(userId: string) {
     const wallets = await this.prisma.wallet.findMany({
-      where: { userId },
+      where: { userId, status: WalletStatus.ACTIVE },
       orderBy: [{ isPrimary: 'desc' }, { createdAt: 'desc' }],
     });
     return wallets.map(toWalletResponse);
@@ -305,6 +305,13 @@ export class WalletsService {
       const candidate = byProviderRef ?? byAddress;
       if (candidate && candidate.chain !== chain) {
         throw new PrivyWalletNotReadyException('Privy wallet chain does not match linked wallet');
+      }
+      if (
+        candidate &&
+        candidate.userId === input.userId &&
+        candidate.status === WalletStatus.REVOKED
+      ) {
+        return candidate;
       }
       if (activeEmbedded && activeEmbedded.id !== candidate?.id) {
         throw new PrivyWalletNotReadyException(

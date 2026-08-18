@@ -320,6 +320,22 @@ describe('WalletsService', () => {
     ).rejects.toBeInstanceOf(WalletLimitReachedException);
   });
 
+  it('lists only active wallets', async () => {
+    wallets.push(
+      createWallet({ id: 'wallet-active', address: ADDRESS_1 }),
+      createWallet({
+        id: 'wallet-revoked',
+        address: ADDRESS_2,
+        status: WalletStatus.REVOKED,
+      }),
+    );
+
+    const result = await service.listUserWallets('user-1');
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ id: 'wallet-active', status: WalletStatus.ACTIVE });
+  });
+
   it('syncs a Privy wallet idempotently', async () => {
     const input = {
       userId: 'user-1',
@@ -338,6 +354,33 @@ describe('WalletsService', () => {
       provider: WalletProvider.PRIVY,
       isPrimary: true,
     });
+  });
+
+  it('does not reactivate a revoked Privy wallet during background sync', async () => {
+    wallets.push(
+      createWallet({
+        id: 'wallet-revoked',
+        type: WalletType.EMBEDDED,
+        provider: WalletProvider.PRIVY,
+        providerUserRef: 'did:privy:user-1',
+        providerWalletRef: 'privy-wallet-1',
+        status: WalletStatus.REVOKED,
+      }),
+    );
+
+    const result = await service.syncEmbeddedWallet({
+      userId: 'user-1',
+      address: ADDRESS_1,
+      providerUserRef: 'did:privy:user-1',
+      providerWalletRef: 'privy-wallet-1',
+    });
+
+    expect(result).toMatchObject({
+      id: 'wallet-revoked',
+      status: WalletStatus.REVOKED,
+      isPrimary: false,
+    });
+    expect(wallets[0]?.status).toBe(WalletStatus.REVOKED);
   });
 
   it('preserves case-sensitive Solana and Tron Privy addresses', async () => {
@@ -473,7 +516,7 @@ describe('WalletsService', () => {
       },
       wallet: {
         findMany: jest.fn(({ where }) =>
-          Promise.resolve(wallets.filter((wallet) => wallet.userId === where.userId)),
+          Promise.resolve(wallets.filter((wallet) => walletMatches(wallet, where))),
         ),
         findUnique: jest.fn(({ where }) => {
           if (where.chain_address) {

@@ -24,7 +24,7 @@ import { PrivyWalletProvider } from './privy-wallet-provider.service';
 import { WalletsService } from './wallets.service';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../database/prisma.service';
-import { Chain, NetworkFamily } from '@prisma/client';
+import { Chain, NetworkFamily, WalletStatus } from '@prisma/client';
 import { AccountService } from '../account/account.service';
 import { Optional } from '@nestjs/common';
 import { UserUpdatesService } from '../user-updates/user-updates.service';
@@ -155,16 +155,19 @@ export class WalletsController {
         : providerWallet.chainType === 'tron'
           ? Chain.TRON
           : undefined;
-      wallets.push(await this.walletsService.syncEmbeddedWallet({
+      const wallet = await this.walletsService.syncEmbeddedWallet({
         userId: user.id,
         ...providerWallet,
         chain,
         audit: getRequestMetadata(request),
-      }));
+      });
+      if (wallet.status === WalletStatus.ACTIVE) {
+        wallets.push(wallet);
+      }
     }
     const primary = wallets.find((wallet) => wallet.isPrimary) ?? wallets[0];
     this.userUpdates?.publish(user.id, ['wallets']);
-    return { ...primary, wallets };
+    return primary ? { ...primary, wallets } : { wallets };
   }
 
   @Patch(':id/primary')

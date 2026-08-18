@@ -95,4 +95,36 @@ describe('WalletsController mutation metadata', () => {
       { ipAddress: '127.0.0.1', userAgent: 'jest' },
     );
   });
+
+  it('does not return a revoked embedded wallet from background sync', async () => {
+    const walletsService = {
+      syncEmbeddedWallet: jest.fn().mockResolvedValue({
+        ...wallet,
+        type: 'EMBEDDED',
+        provider: 'PRIVY',
+        status: 'REVOKED',
+        isPrimary: false,
+      }),
+    };
+    const privyProvider = {
+      getEmbeddedWallets: jest.fn().mockResolvedValue([{
+        address: wallet.address,
+        chainType: 'ethereum',
+        providerUserRef: 'did:privy:user-1',
+        providerWalletRef: 'privy-wallet-1',
+      }]),
+    };
+    const controller = new WalletsController(
+      walletsService as unknown as WalletsService,
+      privyProvider as unknown as PrivyWalletProvider,
+      { get: jest.fn() } as unknown as ConfigService,
+      { network: { findMany: jest.fn() } } as never,
+      { getConnectedWalletBalancesForUser: jest.fn() } as never,
+    );
+
+    await expect(controller.syncEmbedded(user, {
+      get: jest.fn(),
+      ip: '127.0.0.1',
+    } as any)).resolves.toEqual({ wallets: [] });
+  });
 });
