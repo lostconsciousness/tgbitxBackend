@@ -17,6 +17,7 @@
     "privy:provision-solana": "npm --workspace @dream-exchange/api run privy:provision-solana",
     "privy:provision-tron": "npm --workspace @dream-exchange/api run privy:provision-tron",
     "privy:update-deposit-sweep-policy": "npm --workspace @dream-exchange/api run privy:update-deposit-sweep-policy",
+    "privy:update-tron-deposit-sweep-policy": "npm --workspace @dream-exchange/api run privy:update-tron-deposit-sweep-policy",
     "privy:update-spot-liquidity-policy": "npm --workspace @dream-exchange/api run privy:update-spot-liquidity-policy",
     "privy:provision-hyperliquid": "npm --workspace @dream-exchange/api run privy:provision-hyperliquid",
     "hyperliquid:spot-to-perp": "npm --workspace @dream-exchange/api run hyperliquid:spot-to-perp",

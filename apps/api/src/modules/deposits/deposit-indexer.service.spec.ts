@@ -9,6 +9,57 @@ import { DepositsService } from './deposits.service';
 import { DepositIndexerService } from './deposit-indexer.service';
 
 describe('DepositIndexerService', () => {
+  it('uses the cursor-aware scanner for a personal Tron sync', async () => {
+    const prisma = {
+      userDepositAddress: {
+        findMany: jest.fn().mockResolvedValue([
+          { id: 'address-1', userId: 'user-1', address: 'TDeposit', network: Chain.TRON },
+        ]),
+      },
+      tokenContract: {
+        findMany: jest.fn().mockResolvedValue([
+          {
+            id: 'contract-usdt',
+            standard: TokenStandard.TRC20,
+            asset: { id: 'asset-usdt', symbol: 'USDT' },
+            network: {
+              id: 'network-tron',
+              chainKey: 'tron',
+              legacyChain: Chain.TRON,
+              family: NetworkFamily.TVM,
+            },
+          },
+        ]),
+      },
+    };
+    const deposits = { creditReadyDeposits: jest.fn().mockResolvedValue(0) };
+    const config = {
+      get: jest.fn((key: string, fallback?: unknown) =>
+        key === 'DEPOSIT_INDEXER_BALANCE_FALLBACK_ENABLED' ? false : fallback,
+      ),
+    } as unknown as ConfigService;
+    const service = new DepositIndexerService(
+      {} as AssetsService,
+      deposits as unknown as DepositsService,
+      config,
+      {} as RpcProvider,
+      prisma as unknown as PrismaService,
+      {} as OnchainReadinessService,
+      {} as NonEvmTestnetAdapterService,
+    );
+    const scan = jest.spyOn(service, 'scanDeposits').mockResolvedValue({} as never);
+
+    await service.syncPersonalDepositsForUser('user-1');
+
+    expect(scan).toHaveBeenCalledWith({
+      assetSymbol: 'USDT',
+      network: 'tron',
+      fromBlock: 0,
+      userId: 'user-1',
+    });
+    expect(deposits.creditReadyDeposits).toHaveBeenCalledTimes(1);
+  });
+
   it('does not credit native sweep gas funding as a user deposit', async () => {
     const gasAddress = '0x1111111111111111111111111111111111111111';
     const depositAddress = '0x2222222222222222222222222222222222222222';

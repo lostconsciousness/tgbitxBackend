@@ -17,6 +17,7 @@
     "privy:provision-solana": "ts-node scripts/provision-privy-solana-wallet.ts",
     "privy:provision-tron": "ts-node scripts/provision-privy-tron-wallet.ts",
     "privy:update-deposit-sweep-policy": "ts-node scripts/update-deposit-sweep-policy.ts",
+    "privy:update-tron-deposit-sweep-policy": "ts-node scripts/update-tron-deposit-sweep-policy.ts",
     "privy:update-spot-liquidity-policy": "ts-node scripts/update-spot-liquidity-policy.ts",
     "privy:provision-hyperliquid": "ts-node scripts/provision-privy-hyperliquid.ts",
     "hyperliquid:spot-to-perp": "ts-node scripts/transfer-hyperliquid-spot-to-perp.ts",

@@ -6,6 +6,7 @@ import {
   DepositChannel,
   DepositStatus,
   NetworkFamily,
+  Prisma,
   TokenStandard,
 } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
@@ -21,6 +22,39 @@ const assetValuationMock = {} as AssetValuationService;
 const nonEvmMock = {} as never;
 
 describe('DepositsService', () => {
+  it('retries a serializable deposit write conflict without double crediting', async () => {
+    const existingDeposit = { id: 'deposit-existing', status: DepositStatus.CREDITED };
+    const prisma = {
+      $transaction: jest.fn()
+        .mockRejectedValueOnce(new Prisma.PrismaClientKnownRequestError(
+          'Transaction failed due to a write conflict',
+          { code: 'P2034', clientVersion: 'test' },
+        ))
+        .mockResolvedValueOnce(existingDeposit),
+    };
+    const service = new DepositsService(
+      prisma as unknown as PrismaService,
+      {} as AssetsService,
+      {} as WalletsService,
+      {} as LedgerService,
+      {} as ConfigService,
+      {} as RpcProvider,
+      {} as DepositAddressService,
+      assetValuationMock,
+      nonEvmMock,
+    );
+
+    await expect(service.recordDetectedDeposit({
+      assetId: 'asset-usdt',
+      toAddress: 'TDeposit',
+      txHash: 'tron-tx',
+      logIndex: 0,
+      amount: '50',
+      confirmations: 20,
+    })).resolves.toBe(existingDeposit);
+    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+  });
+
   it('reverses and hides a previously credited internal sweep gas transfer', async () => {
     const gasAddress = '0x1111111111111111111111111111111111111111';
     const creditedDeposit = {

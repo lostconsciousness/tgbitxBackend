@@ -885,23 +885,14 @@ export class DepositIndexerService {
       }
 
       try {
-        this.nonEvm.assertSupportedNetwork(contract.network);
-        const result = await this.nonEvm.scanDeposits({
-          asset: contract.asset,
-          tokenContract: {
-            ...contract,
-            network: contract.network,
-            asset: contract.asset,
-          },
+        // Route TVM scans through the same per-address cursor path as the
+        // global indexer. Direct adapter scans replayed full Tron history and
+        // could race the cron scanner while writing the same deposit.
+        await this.scanDeposits({
+          assetSymbol: contract.asset.symbol,
+          network: contract.network.chainKey,
           fromBlock: 0,
-          personalAddresses,
-        });
-        await this.recordNonEvmDetectedDeposits({
-          asset: contract.asset,
-          tokenContract: contract,
-          network: contract.network,
-          legacyChain,
-          detected: result.deposits,
+          userId,
         });
       } catch (error) {
         this.logger.warn(

@@ -824,7 +824,6 @@ export class DepositSweepService {
           status: DepositSweepStatus.FUNDING_GAS,
           gasFundingTxHash: sent.txHash,
           gasFundingProviderRequestId: sent.providerRequestId,
-          attempts: { increment: 1 },
           startedAt: new Date(),
         },
       });
@@ -836,24 +835,39 @@ export class DepositSweepService {
       data: { status: DepositSweepStatus.BROADCASTING, attempts: { increment: 1 }, startedAt: new Date() },
     });
     const referenceId = this.buildSweepReferenceId('sweep', sweep.id, broadcasting.attempts);
-    const sent = isNative
-      ? await this.custody.sendTronNativeTransfer({
-          walletId: sweep.depositAddress.providerWalletRef,
-          fromAddress: source,
-          toAddress: treasuryAddress,
-          amountSun: Number(amount),
-          referenceId,
-          mainnet: true,
-        })
-      : await this.custody.sendTronTrc20Transfer({
-          walletId: sweep.depositAddress.providerWalletRef,
-          fromAddress: source,
-          toAddress: treasuryAddress,
-          contractAddress: target.tokenContract.address!,
-          rawAmount: amount,
-          referenceId,
-          mainnet: true,
-        });
+    let sent: { txHash: string; providerRequestId?: string };
+    try {
+      sent = isNative
+        ? await this.custody.sendTronNativeTransfer({
+            walletId: sweep.depositAddress.providerWalletRef,
+            fromAddress: source,
+            toAddress: treasuryAddress,
+            amountSun: Number(amount),
+            referenceId,
+            mainnet: true,
+          })
+        : await this.custody.sendTronTrc20Transfer({
+            walletId: sweep.depositAddress.providerWalletRef,
+            fromAddress: source,
+            toAddress: treasuryAddress,
+            contractAddress: target.tokenContract.address!,
+            rawAmount: amount,
+            referenceId,
+            feeLimitSun: Number(feeReserveSun),
+            mainnet: true,
+          });
+    } catch (error) {
+      // Nothing was broadcast, so keep the sweep retryable instead of leaving
+      // it in the in-flight state until the attempt limit is exhausted.
+      await this.prisma.depositSweep.update({
+        where: { id: sweep.id },
+        data: {
+          status: DepositSweepStatus.PENDING,
+          failureReason: (error instanceof Error ? error.message : 'Tron sweep failed').slice(0, 500),
+        },
+      });
+      throw error;
+    }
     await this.prisma.depositSweep.update({
       where: { id: sweep.id },
       data: {

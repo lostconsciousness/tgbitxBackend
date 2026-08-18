@@ -1033,10 +1033,25 @@ export class DepositsService {
     confirmations: number;
     forceUnmatched?: boolean;
   }) {
-    return this.prisma.$transaction(
-      (tx) => this.recordDetectedDepositInTransaction(input, tx),
-      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
-    );
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        return await this.prisma.$transaction(
+          (tx) => this.recordDetectedDepositInTransaction(input, tx),
+          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+        );
+      } catch (error) {
+        if (!this.isRetryableDepositWriteConflict(error) || attempt === maxAttempts) {
+          throw error;
+        }
+      }
+    }
+    throw new Error('Deposit transaction retry loop exhausted unexpectedly');
+  }
+
+  private isRetryableDepositWriteConflict(error: unknown): boolean {
+    return error instanceof Prisma.PrismaClientKnownRequestError &&
+      (error.code === 'P2034' || error.code === 'P2002');
   }
 
   private async recordDetectedDepositInTransaction(
