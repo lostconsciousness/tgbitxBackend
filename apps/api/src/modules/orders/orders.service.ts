@@ -59,6 +59,15 @@ export function calculateMaxAffordablePerpSize(input: {
   return cappedSize.toDecimalPlaces(input.sizePrecision, Prisma.Decimal.ROUND_FLOOR);
 }
 
+export function isFeeOnlyBalanceShortfall(input: {
+  availableBalance: Prisma.Decimal;
+  margin: Prisma.Decimal;
+  fee: Prisma.Decimal;
+}): boolean {
+  return input.margin.lessThanOrEqualTo(input.availableBalance) &&
+    input.margin.plus(input.fee).greaterThan(input.availableBalance);
+}
+
 @Injectable()
 export class OrdersService {
   private providerExecutionQueue: Promise<void> = Promise.resolve();
@@ -353,7 +362,7 @@ export class OrdersService {
     let executionPrice = route === ExecutionRoute.B_BOOK_INTERNAL
       ? this.calculateBookVwap(book, dto.side, size)
       : mark;
-    if (dto.useAvailableBalance) {
+    if (!dto.reduceOnly) {
       const availableBalance = this.isMainnetBalanceMode()
         ? await this.ledger.getUserMainnetSpotBalance({
             userId,
@@ -363,7 +372,7 @@ export class OrdersService {
             userId,
             assetId: market.quoteAssetId,
           });
-      size = calculateMaxAffordablePerpSize({
+      const maxAffordableSize = calculateMaxAffordablePerpSize({
         availableBalance,
         marginPrice: mark,
         feePrice: executionPrice,
@@ -372,8 +381,33 @@ export class OrdersService {
         sizePrecision: market.sizePrecision,
         maxNotional,
       });
-      if (route === ExecutionRoute.B_BOOK_INTERNAL && size.greaterThan(0)) {
+      const requestedMargin = size.mul(mark).div(leverage);
+      const requestedFee = size.mul(executionPrice).mul(feeConfig.takerFeeBps).div(10_000);
+      const feeOnlyShortfall = isFeeOnlyBalanceShortfall({
+        availableBalance,
+        margin: requestedMargin,
+        fee: requestedFee,
+      });
+      if (dto.useAvailableBalance) {
+        size = maxAffordableSize;
+      } else if (feeOnlyShortfall) {
+        size = Prisma.Decimal.min(size, maxAffordableSize);
+      }
+      if (
+        route === ExecutionRoute.B_BOOK_INTERNAL &&
+        (dto.useAvailableBalance || feeOnlyShortfall) &&
+        size.greaterThan(0)
+      ) {
         executionPrice = this.calculateBookVwap(book, dto.side, size);
+        size = Prisma.Decimal.min(size, calculateMaxAffordablePerpSize({
+          availableBalance,
+          marginPrice: mark,
+          feePrice: executionPrice,
+          leverage,
+          takerFeeBps: feeConfig.takerFeeBps,
+          sizePrecision: market.sizePrecision,
+          maxNotional,
+        }));
       }
     }
     if (size.lessThan(market.minOrderSize)) {

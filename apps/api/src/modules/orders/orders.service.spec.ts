@@ -28,7 +28,11 @@ import { MarketsService } from '../markets/markets.service';
 import { RoutingService } from '../routing/routing.service';
 import { OperationalSettingsService } from '../settings/operational-settings.service';
 import { assertBalancedLedgerEntries } from '../ledger/ledger.validator';
-import { calculateMaxAffordablePerpSize, OrdersService } from './orders.service';
+import {
+  calculateMaxAffordablePerpSize,
+  isFeeOnlyBalanceShortfall,
+  OrdersService,
+} from './orders.service';
 
 describe('calculateMaxAffordablePerpSize', () => {
   it('includes both initial margin and taker fee and rounds down', () => {
@@ -59,6 +63,19 @@ describe('calculateMaxAffordablePerpSize', () => {
     });
 
     expect(size.toString()).toBe('0.05');
+  });
+
+  it('identifies a shortfall caused only by the fee', () => {
+    expect(isFeeOnlyBalanceShortfall({
+      availableBalance: new Prisma.Decimal(10),
+      margin: new Prisma.Decimal(10),
+      fee: new Prisma.Decimal('0.05'),
+    })).toBe(true);
+    expect(isFeeOnlyBalanceShortfall({
+      availableBalance: new Prisma.Decimal(10),
+      margin: new Prisma.Decimal('10.01'),
+      fee: new Prisma.Decimal('0.05'),
+    })).toBe(false);
   });
 });
 
