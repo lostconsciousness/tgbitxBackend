@@ -19,6 +19,7 @@ export type HyperliquidPerpSyncResult = {
   marketsUpserted: number;
   assetsCreated: number;
   skippedDelisted: number;
+  marketsDeactivated: number;
 };
 
 function configuredLegacyChain(): Chain {
@@ -50,8 +51,8 @@ function minOrderSizeForSzDecimals(szDecimals: number): string {
   return `0.${'0'.repeat(Math.max(0, szDecimals - 1))}1`;
 }
 
-function tradingViewSymbolFor(baseAssetSymbol: string): string {
-  return `HYPERLIQUID:${baseAssetSymbol}USDC`;
+export function hyperliquidTradingViewSymbolFor(providerSymbol: string): string {
+  return `HYPERLIQUID:${providerSymbol.toUpperCase()}USDC.P`;
 }
 
 export async function syncHyperliquidPerpMarkets(
@@ -78,10 +79,24 @@ export async function syncHyperliquidPerpMarkets(
   let marketsUpserted = 0;
   let assetsCreated = 0;
   let skippedDelisted = 0;
+  let marketsDeactivated = 0;
 
   for (const hlAsset of meta.universe) {
     if (hlAsset.isDelisted) {
       skippedDelisted += 1;
+      const deactivated = await prisma.market.updateMany({
+        where: {
+          type: MarketType.PERP,
+          providerName: 'HYPERLIQUID',
+          providerSymbol: hlAsset.name,
+          status: MarketStatus.ACTIVE,
+        },
+        data: {
+          status: MarketStatus.DISABLED,
+          orderbookEnabled: false,
+        },
+      });
+      marketsDeactivated += deactivated.count;
       continue;
     }
 
@@ -121,7 +136,7 @@ export async function syncHyperliquidPerpMarkets(
         quoteAssetId: usdc.id,
         providerName: 'HYPERLIQUID',
         providerSymbol: hlAsset.name,
-        tradingViewSymbol: tradingViewSymbolFor(baseAssetSymbol),
+        tradingViewSymbol: hyperliquidTradingViewSymbolFor(hlAsset.name),
         orderbookEnabled: true,
         pricePrecision,
         sizePrecision,
@@ -135,7 +150,7 @@ export async function syncHyperliquidPerpMarkets(
         quoteAssetId: usdc.id,
         providerName: 'HYPERLIQUID',
         providerSymbol: hlAsset.name,
-        tradingViewSymbol: tradingViewSymbolFor(baseAssetSymbol),
+        tradingViewSymbol: hyperliquidTradingViewSymbolFor(hlAsset.name),
         orderbookEnabled: true,
         pricePrecision,
         sizePrecision,
@@ -171,5 +186,6 @@ export async function syncHyperliquidPerpMarkets(
     marketsUpserted,
     assetsCreated,
     skippedDelisted,
+    marketsDeactivated,
   };
 }

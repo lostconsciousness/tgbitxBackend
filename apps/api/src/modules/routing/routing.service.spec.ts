@@ -1,5 +1,5 @@
 import { ConfigService } from '@nestjs/config';
-import { ExecutionRoute, Prisma } from '@prisma/client';
+import { ExecutionRoute, OrderSide, Prisma } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 import { OperationalSettingsService } from '../settings/operational-settings.service';
 import { RoutingService } from './routing.service';
@@ -15,8 +15,9 @@ describe('RoutingService', () => {
     await expect(
       service.decide({
         marketId: 'market-1',
-        notional: new Prisma.Decimal(500),
+        notional: new Prisma.Decimal(100),
         platformMarkAgeMs: 100,
+        ...eligibleMarketInput(),
       }),
     ).resolves.toBe(ExecutionRoute.B_BOOK_INTERNAL);
   });
@@ -33,6 +34,7 @@ describe('RoutingService', () => {
         marketId: 'market-1',
         notional: new Prisma.Decimal(500),
         platformMarkAgeMs: 100,
+        ...eligibleMarketInput(),
       }),
     ).resolves.toBe(ExecutionRoute.A_BOOK_HYPERLIQUID);
   });
@@ -63,18 +65,34 @@ describe('RoutingService', () => {
         },
       } as unknown as PrismaService,
       {
-        get: jest.fn((key: string) => {
+        get: jest.fn((key: string, fallback?: unknown) => {
           const values: Record<string, unknown> = {
             BBOOK_ENABLED: true,
             PLATFORM_CAPITAL_USDC: '10000',
             INSURANCE_CAPITAL_USDC: '2000',
           };
-          return values[key];
+          return values[key] ?? fallback;
         }),
       } as unknown as ConfigService,
       {
         getBoolean: jest.fn().mockResolvedValue(false),
       } as unknown as OperationalSettingsService,
     );
+  }
+
+  function eligibleMarketInput() {
+    return {
+      side: OrderSide.BUY,
+      notional24h: new Prisma.Decimal('5000000'),
+      referenceMark: new Prisma.Decimal('100'),
+      book: {
+        symbol: 'BTC-PERP',
+        provider: 'HYPERLIQUID',
+        providerSymbol: 'BTC',
+        time: Date.now(),
+        bids: [{ price: '99.95', size: '100', orders: 1 }],
+        asks: [{ price: '100.05', size: '100', orders: 1 }],
+      },
+    };
   }
 });

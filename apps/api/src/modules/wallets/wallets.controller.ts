@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Header,
   HttpCode,
   HttpStatus,
   Param,
@@ -24,8 +25,10 @@ import { PrivyWalletProvider } from './privy-wallet-provider.service';
 import { WalletsService } from './wallets.service';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../database/prisma.service';
-import { Chain, NetworkFamily } from '@prisma/client';
+import { Chain, NetworkFamily, WalletStatus } from '@prisma/client';
 import { AccountService } from '../account/account.service';
+import { Optional } from '@nestjs/common';
+import { UserUpdatesService } from '../user-updates/user-updates.service';
 
 @ApiTags('wallets')
 @ApiBearerAuth()
@@ -38,9 +41,11 @@ export class WalletsController {
     private readonly config: ConfigService,
     private readonly prisma: PrismaService,
     private readonly accountService: AccountService,
+    @Optional() private readonly userUpdates?: UserUpdatesService,
   ) {}
 
   @Get()
+  @Header('Cache-Control', 'private, max-age=60, stale-while-revalidate=300')
   @ApiOperation({ summary: 'List current user wallets' })
   list(@CurrentUser() user: AuthenticatedUser) {
     return this.walletsService.listUserWallets(user.id);
@@ -52,6 +57,24 @@ export class WalletsController {
   })
   balances(@CurrentUser() user: AuthenticatedUser) {
     return this.accountService.getConnectedWalletBalancesForUser(user.id);
+  }
+
+  @Get('onchain-balances')
+  @Header('Cache-Control', 'private, max-age=15, stale-while-revalidate=60')
+  @ApiOperation({
+    summary: 'Lazily load balances held on current user personal deposit addresses',
+  })
+  onChainBalances(@CurrentUser() user: AuthenticatedUser) {
+    return this.accountService.getPersonalDepositOnChainBalancesForUser(user.id);
+  }
+
+  @Get('connected-balances')
+  @Header('Cache-Control', 'private, max-age=30, stale-while-revalidate=120')
+  @ApiOperation({
+    summary: 'Lazily load compact on-chain balances for connected wallets',
+  })
+  connectedBalances(@CurrentUser() user: AuthenticatedUser) {
+    return this.accountService.getConnectedWalletBalancesCompactForUser(user.id);
   }
 
   @Get('capabilities')
@@ -121,6 +144,7 @@ export class WalletsController {
       signature: dto.signature,
       audit: getRequestMetadata(request),
     });
+    this.userUpdates?.publish(user.id, ['wallets']);
     return wallet;
   }
 
@@ -151,15 +175,19 @@ export class WalletsController {
         : providerWallet.chainType === 'tron'
           ? Chain.TRON
           : undefined;
-      wallets.push(await this.walletsService.syncEmbeddedWallet({
+      const wallet = await this.walletsService.syncEmbeddedWallet({
         userId: user.id,
         ...providerWallet,
         chain,
         audit: getRequestMetadata(request),
-      }));
+      });
+      if (wallet.status === WalletStatus.ACTIVE) {
+        wallets.push(wallet);
+      }
     }
     const primary = wallets.find((wallet) => wallet.isPrimary) ?? wallets[0];
-    return { ...primary, wallets };
+    this.userUpdates?.publish(user.id, ['wallets']);
+    return primary ? { ...primary, wallets } : { wallets };
   }
 
   @Patch(':id/primary')
@@ -169,11 +197,13 @@ export class WalletsController {
     @Param('id') walletId: string,
     @Req() request: Request,
   ) {
-    return this.walletsService.setPrimaryWallet(
+    const wallet = await this.walletsService.setPrimaryWallet(
       user.id,
       walletId,
       getRequestMetadata(request),
     );
+    this.userUpdates?.publish(user.id, ['wallets']);
+    return wallet;
   }
 
   @Delete(':id')
@@ -183,10 +213,12 @@ export class WalletsController {
     @Param('id') walletId: string,
     @Req() request: Request,
   ) {
-    return this.walletsService.revokeWallet(
+    const wallet = await this.walletsService.revokeWallet(
       user.id,
       walletId,
       getRequestMetadata(request),
     );
+    this.userUpdates?.publish(user.id, ['wallets']);
+    return wallet;
   }
 }

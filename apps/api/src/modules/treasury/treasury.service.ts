@@ -36,7 +36,9 @@ export class TreasuryService {
     @Inject(RPC_PROVIDER) private readonly rpcProvider: RpcProvider,
   ) {}
 
-  @Cron('*/30 * * * * *')
+  // Withdrawals call ensureHotWalletFunded on demand. This slower sweep is only
+  // a safety reconciliation and must not poll every custody balance twice a minute.
+  @Cron('0 */2 * * * *')
   async runAutoRebalance(): Promise<void> {
     if (
       this.rebalanceRunning ||

@@ -52,6 +52,16 @@ type BitcoinExplorerUtxo = {
 
 @Injectable()
 export class NonEvmTestnetAdapterService {
+  private tronNextRequestAt = 0;
+  private tronCircuitOpenUntil = 0;
+  private tronBudgetDay = '';
+  private tronRequestsToday = 0;
+  private readonly tronBlockTimestampCache = new Map<number, number>();
+  private readonly tronTrc20HistoryCache = new Map<
+    string,
+    { expiresAt: number; value: Promise<any[]> }
+  >();
+
   constructor(
     private readonly config: ConfigService,
     private readonly custody: PrivyCustodyService,
@@ -73,9 +83,25 @@ export class NonEvmTestnetAdapterService {
     if (network.mainnet && !this.config.get<boolean>('MAINNET_ENABLED', false)) {
       throw new ServiceUnavailableException(`${network.chainKey} mainnet adapter is not enabled`);
     }
+    if (
+      network.family === NetworkFamily.TVM &&
+      network.mainnet &&
+      this.config.get<string>('NODE_ENV', 'development') === 'production' &&
+      !this.config.get<string>('TRON_PRO_API_KEY', '').trim()
+    ) {
+      throw new ServiceUnavailableException('TRON_PRO_API_KEY is required for production Tron scanning');
+    }
     if (!this.resolveRpcUrl(network) && network.family !== NetworkFamily.UTXO) {
       throw new ServiceUnavailableException(`${network.chainKey} RPC URL is not configured`);
     }
+  }
+
+  async isTronTreasuryTransfer(fromAddress?: string): Promise<boolean> {
+    if (!fromAddress) return false;
+    const walletId = this.config.get<string>('PRIVY_TRON_WALLET_ID');
+    if (!walletId || !this.custody.isTronEnabled()) return false;
+    const treasuryAddress = await this.custody.getWalletAddress(walletId);
+    return treasuryAddress.toLowerCase() === fromAddress.toLowerCase();
   }
 
   async provisionDepositAddress(network: Network): Promise<{
@@ -180,12 +206,15 @@ export class NonEvmTestnetAdapterService {
     tokenContract: NonEvmTokenContract;
     fromBlock: number;
     toBlock?: number;
+    fromTimestampMs?: number;
+    toTimestampMs?: number;
     personalAddresses: Array<{ id: string; userId: string; address: string }>;
   }): Promise<{
     latestBlock: number;
     toBlock: number;
     scannedTransactions: number;
     deposits: DetectedDeposit[];
+    toTimestampMs?: number;
   }> {
     this.assertSupportedNetwork(input.tokenContract.network);
     if (input.tokenContract.network.family === NetworkFamily.SVM) {
@@ -272,7 +301,13 @@ export class NonEvmTestnetAdapterService {
     toAddress: string;
     amount: string;
     requiredConfirmations: number;
-  }): Promise<{ confirmed: boolean; gasUsed?: bigint; effectiveGasPrice?: bigint }> {
+  }): Promise<{
+    confirmed: boolean;
+    failed?: boolean;
+    failureReason?: string;
+    gasUsed?: bigint;
+    effectiveGasPrice?: bigint;
+  }> {
     this.assertSupportedNetwork(input.network);
     if (input.network.family === NetworkFamily.SVM) {
       return this.confirmSolanaWithdrawal(input);
@@ -434,19 +469,32 @@ export class NonEvmTestnetAdapterService {
     tokenContract: NonEvmTokenContract;
     fromBlock: number;
     toBlock?: number;
+    fromTimestampMs?: number;
+    toTimestampMs?: number;
     personalAddresses: Array<{ id: string; userId: string; address: string }>;
   }) {
     const latestBlock = await this.getLatestBlock(input.tokenContract.network);
     const toBlock = input.toBlock ?? latestBlock;
+    const fromTimestampMs = input.fromTimestampMs ??
+      await this.resolveTronBlockTimestamp(input.tokenContract.network, input.fromBlock);
+    const toTimestampMs = input.toTimestampMs ?? Date.now();
     const deposits: DetectedDeposit[] = [];
     let scannedTransactions = 0;
 
     for (const address of input.personalAddresses) {
       if (input.tokenContract.standard === TokenStandard.NATIVE) {
-        const data = await this.tronGridGet<any>(
-          input.tokenContract.network,
-          `/v1/accounts/${address.address}/transactions?only_to=true&limit=200`,
-        );
+        let data: any;
+        try {
+          data = { data: await this.loadTronHistoryPages(
+            input.tokenContract.network,
+            address.address,
+            'native',
+            fromTimestampMs,
+            toTimestampMs,
+          ) };
+        } catch (error) {
+          throw error;
+        }
         for (const tx of data.data ?? []) {
           const contract = tx.raw_data?.contract?.[0];
           const value = contract?.parameter?.value;
@@ -476,14 +524,26 @@ export class NonEvmTestnetAdapterService {
         continue;
       }
       if (input.tokenContract.standard === TokenStandard.TRC20 && input.tokenContract.address) {
-        const data = await this.tronGridGet<any>(
-          input.tokenContract.network,
-          `/v1/accounts/${address.address}/transactions/trc20?only_to=true&contract_address=${input.tokenContract.address}&limit=200`,
-        );
+        let data: any;
+        try {
+          data = { data: await this.loadTronHistoryPages(
+            input.tokenContract.network,
+            address.address,
+            'trc20',
+            fromTimestampMs,
+            toTimestampMs,
+          ) };
+        } catch (error) {
+          throw error;
+        }
         const blockCache = new Map<string, number>();
         for (const tx of data.data ?? []) {
           const txHash = String(tx.transaction_id ?? tx.txID ?? tx.txid ?? '');
-          if (!txHash || tx.to !== address.address) {
+          if (
+            !txHash ||
+            tx.to !== address.address ||
+            String(tx.token_info?.address ?? '').toLowerCase() !== input.tokenContract.address.toLowerCase()
+          ) {
             continue;
           }
           const blockNumber = await this.resolveTronTransactionBlockNumber(
@@ -512,6 +572,199 @@ export class NonEvmTestnetAdapterService {
       }
     }
 
+    return { latestBlock, toBlock, toTimestampMs, scannedTransactions, deposits };
+  }
+
+  private async loadTronHistoryPages(
+    network: Network,
+    address: string,
+    stream: 'native' | 'trc20',
+    fromTimestampMs: number,
+    toTimestampMs: number,
+  ): Promise<any[]> {
+    const cacheKey = `${network.chainKey}:${address}:${stream}:${fromTimestampMs}:${toTimestampMs}`;
+    const cached = this.tronTrc20HistoryCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+    const value = this.fetchTronHistoryPages(
+      network,
+      address,
+      stream,
+      fromTimestampMs,
+      toTimestampMs,
+    );
+    this.tronTrc20HistoryCache.set(cacheKey, {
+      expiresAt: Date.now() + 30_000,
+      value,
+    });
+    value.catch(() => this.tronTrc20HistoryCache.delete(cacheKey));
+    return value;
+  }
+
+  private async fetchTronHistoryPages(
+    network: Network,
+    address: string,
+    stream: 'native' | 'trc20',
+    fromTimestampMs: number,
+    toTimestampMs: number,
+  ): Promise<any[]> {
+    const rows: any[] = [];
+    let fingerprint: string | undefined;
+    for (let page = 0; page < 1_000; page += 1) {
+      const query = new URLSearchParams({
+        only_confirmed: 'true',
+        only_to: 'true',
+        order_by: 'block_timestamp,asc',
+        min_timestamp: String(Math.max(0, fromTimestampMs)),
+        max_timestamp: String(toTimestampMs),
+        limit: '200',
+      });
+      if (fingerprint) query.set('fingerprint', fingerprint);
+      const suffix = stream === 'trc20' ? '/transactions/trc20' : '/transactions';
+      const response = await this.tronGridGet<{
+        data?: any[];
+        success?: boolean;
+        meta?: { fingerprint?: string };
+      }>(network, `/v1/accounts/${address}${suffix}?${query.toString()}`);
+      if (response.success === false) {
+        throw new ServiceUnavailableException('TRON history API returned success=false');
+      }
+      rows.push(...(response.data ?? []));
+      const next = response.meta?.fingerprint;
+      if (!next || next === fingerprint || (response.data?.length ?? 0) < 200) return rows;
+      fingerprint = next;
+    }
+    throw new ServiceUnavailableException('TRON history pagination exceeded 1000 pages');
+  }
+
+  private async resolveTronBlockTimestamp(network: Network, blockNumber: number): Promise<number> {
+    if (blockNumber <= 0) return 0;
+    const cached = this.tronBlockTimestampCache.get(blockNumber);
+    if (cached !== undefined) return cached;
+    const block = await this.tronPost<{
+      block_header?: { raw_data?: { timestamp?: number } };
+    }>(network, '/wallet/getblockbynum', { num: blockNumber });
+    const timestamp = Number(block.block_header?.raw_data?.timestamp ?? 0);
+    if (!Number.isFinite(timestamp) || timestamp <= 0) {
+      throw new ServiceUnavailableException(`TRON block ${blockNumber} timestamp is unavailable`);
+    }
+    this.tronBlockTimestampCache.set(blockNumber, timestamp);
+    if (this.tronBlockTimestampCache.size > 2_000) {
+      const first = this.tronBlockTimestampCache.keys().next().value;
+      if (first !== undefined) this.tronBlockTimestampCache.delete(first);
+    }
+    return timestamp;
+  }
+
+  private async scanTronTrc20JsonRpc(
+    input: {
+      asset: Asset;
+      tokenContract: NonEvmTokenContract;
+      fromBlock: number;
+      personalAddresses: Array<{ id: string; userId: string; address: string }>;
+    },
+    latestBlock: number,
+    toBlock: number,
+  ) {
+    const TronWeb = await this.importTronWeb();
+    const fromBlock = Math.max(
+      input.fromBlock,
+      toBlock - this.config.get<number>('TRON_JSON_RPC_SCAN_BLOCKS', 100),
+    );
+    const contract = `0x${String(TronWeb.address.toHex(input.tokenContract.address)).slice(2)}`;
+    const personalByTopic = new Map(input.personalAddresses.map((address) => [
+      `0x${String(TronWeb.address.toHex(address.address)).slice(2).padStart(64, '0')}`.toLowerCase(),
+      address,
+    ]));
+    const destinationTopics = [...personalByTopic.keys()];
+    if (destinationTopics.length === 0) {
+      return { latestBlock, toBlock, scannedTransactions: 0, deposits: [] };
+    }
+    const logs = await this.tronJsonRpc<any[]>(input.tokenContract.network, 'eth_getLogs', [{
+      address: contract,
+      fromBlock: `0x${fromBlock.toString(16)}`,
+      toBlock: `0x${toBlock.toString(16)}`,
+      topics: [
+        '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
+        null,
+        destinationTopics.length === 1 ? destinationTopics[0] : destinationTopics,
+      ],
+    }]);
+    const deposits: DetectedDeposit[] = [];
+    for (const log of logs ?? []) {
+      const personal = personalByTopic.get(String(log.topics?.[2] ?? '').toLowerCase());
+      if (!personal) continue;
+      const rawAmount = BigInt(log.data ?? '0x0').toString();
+      if (rawAmount === '0') continue;
+      const blockNumber = Number.parseInt(log.blockNumber, 16);
+      const fromHex = `41${String(log.topics?.[1] ?? '').slice(-40)}`;
+      deposits.push({
+        depositAddressId: personal.id,
+        userId: personal.userId,
+        fromAddress: TronWeb.address.fromHex(fromHex),
+        toAddress: personal.address,
+        txHash: String(log.transactionHash).replace(/^0x/, ''),
+        outputIndex: Number.parseInt(log.logIndex ?? '0x0', 16),
+        blockNumber,
+        amount: this.formatRawAmount(rawAmount, input.tokenContract.decimals),
+        rawAmount,
+        confirmations: Math.max(0, latestBlock - blockNumber + 1),
+      });
+    }
+    return { latestBlock, toBlock, scannedTransactions: logs?.length ?? 0, deposits };
+  }
+
+  private async scanTronNativeJsonRpc(
+    input: {
+      asset: Asset;
+      tokenContract: NonEvmTokenContract;
+      fromBlock: number;
+      personalAddresses: Array<{ id: string; userId: string; address: string }>;
+    },
+    latestBlock: number,
+    toBlock: number,
+  ) {
+    const TronWeb = await this.importTronWeb();
+    const fromBlock = Math.max(
+      input.fromBlock,
+      toBlock - this.config.get<number>('TRON_JSON_RPC_NATIVE_SCAN_BLOCKS', 60),
+    );
+    const personalByEvm = new Map(input.personalAddresses.map((address) => [
+      `0x${String(TronWeb.address.toHex(address.address)).slice(2)}`.toLowerCase(),
+      address,
+    ]));
+    const requests = Array.from({ length: Math.max(0, toBlock - fromBlock + 1) }, (_value, index) => ({
+      jsonrpc: '2.0',
+      id: index + 1,
+      method: 'eth_getBlockByNumber',
+      params: [`0x${(fromBlock + index).toString(16)}`, true],
+    }));
+    const responses = await this.tronJsonRpcBatch<any>(input.tokenContract.network, requests);
+    const deposits: DetectedDeposit[] = [];
+    let scannedTransactions = 0;
+    for (const response of responses) {
+      const block = response.result;
+      const blockNumber = Number.parseInt(block?.number ?? '0x0', 16);
+      for (const tx of block?.transactions ?? []) {
+        scannedTransactions += 1;
+        const personal = personalByEvm.get(String(tx.to ?? '').toLowerCase());
+        const rawAmount = BigInt(tx.value ?? '0x0');
+        if (!personal || rawAmount <= 0n) continue;
+        deposits.push({
+          depositAddressId: personal.id,
+          userId: personal.userId,
+          fromAddress: tx.from
+            ? TronWeb.address.fromHex(`41${String(tx.from).slice(-40)}`)
+            : undefined,
+          toAddress: personal.address,
+          txHash: String(tx.hash).replace(/^0x/, ''),
+          outputIndex: 0,
+          blockNumber,
+          amount: this.formatRawAmount(rawAmount.toString(), input.tokenContract.decimals),
+          rawAmount: rawAmount.toString(),
+          confirmations: Math.max(0, latestBlock - blockNumber + 1),
+        });
+      }
+    }
     return { latestBlock, toBlock, scannedTransactions, deposits };
   }
 
@@ -584,9 +837,17 @@ export class NonEvmTestnetAdapterService {
     tokenContract: Pick<TokenContract, 'standard' | 'address' | 'decimals'>;
     address: string;
   }) {
-    const tronWeb = this.createTronWeb(input.network);
+    const account = await this.tronGridGet<{
+      data?: Array<{
+        balance?: number | string;
+        trc20?: Array<Record<string, string>>;
+      }>;
+    }>(input.network, `/v1/accounts/${input.address}?only_confirmed=true`).catch(() => ({ data: [] }));
+    const details = account.data?.[0];
     if (input.tokenContract.standard === TokenStandard.NATIVE) {
-      const raw = String(await tronWeb.trx.getBalance(input.address));
+      const raw = details
+        ? String(details.balance ?? 0)
+        : await this.getTronNativeJsonRpcBalance(input.address);
       return {
         balance: this.formatRawAmount(raw, input.tokenContract.decimals),
         rawBalance: raw,
@@ -594,22 +855,110 @@ export class NonEvmTestnetAdapterService {
       };
     }
     if (input.tokenContract.standard === TokenStandard.TRC20 && input.tokenContract.address) {
-      try {
-        tronWeb.setAddress(input.address);
-        const contract = await tronWeb.contract().at(input.tokenContract.address);
-        const raw = String(
-          await contract.balanceOf(input.address).call({ from: input.address }),
-        );
-        return {
-          balance: this.formatRawAmount(raw, input.tokenContract.decimals),
-          rawBalance: raw,
-          status: 'AVAILABLE' as const,
-        };
-      } catch (_error) {
-        return { balance: null, rawBalance: null, status: 'UNAVAILABLE' as const };
-      }
+      const expected = input.tokenContract.address.toLowerCase();
+      const entry = (details?.trc20 ?? []).find((item) =>
+        Object.keys(item).some((address) => address.toLowerCase() === expected),
+      );
+      const matchedKey = entry
+        ? Object.keys(entry).find((address) => address.toLowerCase() === expected)
+        : undefined;
+      const raw = matchedKey
+        ? String(entry?.[matchedKey] ?? 0)
+        : await this.getTronTrc20ContractBalance(
+            input.network,
+            input.address,
+            input.tokenContract.address,
+          );
+      return {
+        balance: this.formatRawAmount(raw, input.tokenContract.decimals),
+        rawBalance: raw,
+        status: 'AVAILABLE' as const,
+      };
     }
     return { balance: null, rawBalance: null, status: 'UNAVAILABLE' as const };
+  }
+
+  private async getTronTrc20ContractBalance(
+    network: Network,
+    address: string,
+    contractAddress: string,
+  ): Promise<string> {
+    const TronWeb = await this.importTronWeb();
+    try {
+      const owner = String(TronWeb.address.toHex(address)).slice(2).padStart(64, '0');
+      const contract = `0x${String(TronWeb.address.toHex(contractAddress)).slice(2)}`;
+      const url = this.config.get<string>(
+        'TRON_JSON_RPC_URL',
+        'https://tron-rpc.publicnode.com/jsonrpc',
+      );
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'eth_call',
+          params: [{ to: contract, data: `0x70a08231${owner}` }, 'latest'],
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const result = await response.json().catch(() => ({})) as {
+        result?: string;
+      };
+      if (response.ok && result.result) return BigInt(result.result).toString();
+    } catch (_error) {
+      // Continue with FullNode contract calls.
+    }
+    const keyedHeaders = this.tronApiHeaders(network);
+    const headerVariants = Object.hasOwn(keyedHeaders, 'TRON-PRO-API-KEY')
+      ? [keyedHeaders, this.tronApiHeadersWithoutKey()]
+      : [keyedHeaders];
+    let lastError: unknown;
+    for (const fullHost of this.resolveTronApiUrls(network, false)) {
+      for (const headers of headerVariants) {
+        try {
+          const tronWeb = new TronWeb({ fullHost, headers });
+          tronWeb.setAddress(address);
+          const contract = await tronWeb.contract().at(contractAddress);
+          return String(await contract.balanceOf(address).call({ from: address }));
+        } catch (error) {
+          lastError = error;
+        }
+      }
+    }
+    throw new ServiceUnavailableException(
+      `TRON TRC20 balance request failed: ${lastError instanceof Error ? lastError.message : 'unavailable'}`,
+    );
+  }
+
+  private async getTronNativeJsonRpcBalance(address: string): Promise<string> {
+    const TronWeb = await this.importTronWeb();
+    const evmAddress = `0x${String(TronWeb.address.toHex(address)).slice(2)}`;
+    const url = this.config.get<string>(
+      'TRON_JSON_RPC_URL',
+      'https://tron-rpc.publicnode.com/jsonrpc',
+    );
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'eth_getBalance',
+        params: [evmAddress, 'latest'],
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const result = await response.json().catch(() => ({})) as {
+      result?: string;
+      error?: { message?: string };
+    };
+    if (!response.ok || !result.result) {
+      throw new ServiceUnavailableException(
+        result.error?.message ?? `TRON JSON-RPC failed: ${response.status}`,
+      );
+    }
+    return BigInt(result.result).toString();
   }
 
   private async sendSolanaWithdrawal(input: {
@@ -899,8 +1248,21 @@ export class NonEvmTestnetAdapterService {
     const info = await this.tronPost<any>(input.network, '/wallet/gettransactioninfobyid', {
       value: input.txHash,
     }).catch(() => null);
-    if (!info?.blockNumber || info.receipt?.result === 'FAILED') {
+    if (!info?.blockNumber) {
       return { confirmed: false };
+    }
+    const executionResult = String(
+      info.receipt?.result ?? info.result ?? '',
+    ).trim().toUpperCase();
+    if (executionResult && executionResult !== 'SUCCESS') {
+      return {
+        confirmed: false,
+        failed: true,
+        failureReason: `TRON transaction failed: ${executionResult}`,
+        gasUsed: info.receipt?.energy_usage_total !== undefined
+          ? BigInt(info.receipt.energy_usage_total)
+          : undefined,
+      };
     }
     const latest = await this.getTronLatestBlock(input.network);
     return { confirmed: latest - Number(info.blockNumber) + 1 >= input.requiredConfirmations };
@@ -1163,32 +1525,143 @@ export class NonEvmTestnetAdapterService {
   }
 
   private async tronGridGet<T>(network: Network, path: string): Promise<T> {
-    const base = this.resolveTronGridBaseUrl(network).replace(/\/$/, '');
-    const response = await fetch(`${base}${path}`, {
-      headers: this.tronApiHeaders(network),
-    });
-    if (!response.ok) {
-      throw new ServiceUnavailableException(`TRON API request failed: ${response.status}`);
-    }
-    return response.json() as Promise<T>;
+    return this.tronRequest<T>(network, path, { grid: true });
   }
 
   private async tronPost<T>(network: Network, path: string, body: unknown): Promise<T> {
-    const base = this.resolveRpcUrl(network).replace(/\/$/, '');
-    const response = await fetch(`${base}${path}`, {
-      method: 'POST',
-      headers: this.tronApiHeaders(network, true),
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) {
-      throw new ServiceUnavailableException(`TRON API request failed: ${response.status}`);
+    return this.tronRequest<T>(network, path, { body });
+  }
+
+  private async tronRequest<T>(
+    network: Network,
+    path: string,
+    options: { grid?: boolean; body?: unknown },
+  ): Promise<T> {
+    const apiHeaders = this.tronApiHeaders(network, options.body !== undefined);
+    let lastStatus = 0;
+    let lastError: unknown;
+    for (const base of this.resolveTronApiUrls(network, Boolean(options.grid))) {
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        try {
+          await this.waitForTronRequestBudget();
+          const response = await fetch(`${base.replace(/\/$/, '')}${path}`, {
+            ...(options.body !== undefined
+              ? { method: 'POST', body: JSON.stringify(options.body) }
+              : {}),
+            headers: apiHeaders,
+          });
+          if (response.ok) return response.json() as Promise<T>;
+          lastStatus = response.status;
+          if ([403, 429].includes(response.status) || response.status >= 500) {
+            const retryAfter = Number(response.headers.get('retry-after') ?? 0);
+            if (attempt < 3) {
+              await this.waitForTronBackoff(attempt, retryAfter);
+              continue;
+            }
+            this.tronCircuitOpenUntil = Date.now() + Math.max(30_000, retryAfter * 1_000);
+          }
+          if (![401, 403, 429].includes(response.status) && response.status < 500) {
+            throw new ServiceUnavailableException(
+              `TRON API request failed: ${response.status}`,
+            );
+          }
+        } catch (error) {
+          lastError = error;
+          if (attempt < 3 && !(error instanceof ServiceUnavailableException)) {
+            await this.waitForTronBackoff(attempt, 0);
+            continue;
+          }
+        }
+        break;
+      }
     }
-    return response.json() as Promise<T>;
+    if (lastError instanceof ServiceUnavailableException) throw lastError;
+    throw new ServiceUnavailableException(
+      `TRON API request failed: ${lastStatus || 'unavailable'}`,
+    );
+  }
+
+  private async waitForTronBackoff(attempt: number, retryAfterSeconds: number): Promise<void> {
+    const exponentialMs = Math.min(8_000, 250 * (2 ** attempt));
+    const jitterMs = Math.floor(Math.random() * 200);
+    const delayMs = Math.max(retryAfterSeconds * 1_000, exponentialMs + jitterMs);
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+
+  private async waitForTronRequestBudget(): Promise<void> {
+    const now = Date.now();
+    if (this.tronCircuitOpenUntil > now) {
+      throw new ServiceUnavailableException(
+        `TRON API circuit is open for ${this.tronCircuitOpenUntil - now}ms`,
+      );
+    }
+    const day = new Date(now).toISOString().slice(0, 10);
+    if (this.tronBudgetDay !== day) {
+      this.tronBudgetDay = day;
+      this.tronRequestsToday = 0;
+    }
+    const dailyBudget = this.config.get<number>('TRON_API_DAILY_BUDGET', 80_000);
+    if (this.tronRequestsToday >= dailyBudget) {
+      throw new ServiceUnavailableException('TRON API daily request budget exhausted');
+    }
+    const qps = Math.max(1, Math.min(8, this.config.get<number>('TRON_API_MAX_QPS', 8)));
+    const waitMs = Math.max(0, this.tronNextRequestAt - now);
+    if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+    this.tronNextRequestAt = Date.now() + Math.ceil(1_000 / qps);
+    this.tronRequestsToday += 1;
   }
 
   private async getTronLatestBlock(network: Network): Promise<number> {
-    const block = await this.tronPost<any>(network, '/wallet/getnowblock', {});
-    return Number(block?.block_header?.raw_data?.number ?? 0);
+    try {
+      const block = await this.tronPost<any>(network, '/wallet/getnowblock', {});
+      return Number(block?.block_header?.raw_data?.number ?? 0);
+    } catch (_error) {
+      const blockNumber = await this.tronJsonRpc<string>(network, 'eth_blockNumber', []);
+      return Number.parseInt(blockNumber, 16);
+    }
+  }
+
+  private async tronJsonRpc<T>(network: Network, method: string, params: unknown[]): Promise<T> {
+    const response = await this.tronJsonRpcRequest(network, {
+      jsonrpc: '2.0', id: 1, method, params,
+    });
+    if (response.error || response.result === undefined) {
+      throw new ServiceUnavailableException(
+        response.error?.message ?? `TRON JSON-RPC ${method} returned no result`,
+      );
+    }
+    return response.result as T;
+  }
+
+  private async tronJsonRpcBatch<T>(
+    network: Network,
+    requests: Array<Record<string, unknown>>,
+  ): Promise<Array<{ id: number; result?: T; error?: { message?: string } }>> {
+    if (requests.length === 0) return [];
+    const response = await this.tronJsonRpcRequest(network, requests);
+    if (!Array.isArray(response)) {
+      throw new ServiceUnavailableException('TRON JSON-RPC batch returned an invalid response');
+    }
+    return response as Array<{ id: number; result?: T; error?: { message?: string } }>;
+  }
+
+  private async tronJsonRpcRequest(network: Network, body: unknown): Promise<any> {
+    const url = this.config.get<string>(
+      network.chainKey === 'tron' ? 'TRON_JSON_RPC_URL' : 'TRON_NILE_JSON_RPC_URL',
+      network.chainKey === 'tron' ? 'https://tron-rpc.publicnode.com/jsonrpc' : '',
+    );
+    if (!url) throw new ServiceUnavailableException('TRON JSON-RPC is not configured');
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new ServiceUnavailableException(`TRON JSON-RPC failed: ${response.status}`);
+    }
+    return result;
   }
 
   private async importTronWeb(): Promise<any> {
@@ -1216,6 +1689,10 @@ export class NonEvmTestnetAdapterService {
     };
   }
 
+  private tronApiHeadersWithoutKey(json = false): Record<string, string> {
+    return json ? { 'content-type': 'application/json' } : {};
+  }
+
   private tronHexAddress(network: Network, address: string): string {
     return this.createTronWeb(network).address.toHex(address);
   }
@@ -1228,6 +1705,31 @@ export class NonEvmTestnetAdapterService {
     const primary = network.rpcPrimaryEnv ? this.config.get<string>(network.rpcPrimaryEnv, '') : '';
     const fallback = network.rpcFallbackEnv ? this.config.get<string>(network.rpcFallbackEnv, '') : '';
     return (primary || fallback || '').trim();
+  }
+
+  private resolveTronApiUrls(network: Network, grid: boolean): string[] {
+    const primary = network.rpcPrimaryEnv
+      ? this.config.get<string>(network.rpcPrimaryEnv, '').trim()
+      : '';
+    const fallback = network.rpcFallbackEnv
+      ? this.config.get<string>(network.rpcFallbackEnv, '').trim()
+      : '';
+    const configuredGrid = grid ? this.resolveTronGridBaseUrl(network) : '';
+    const explicitFallback = this.config
+      .get<string>(
+        network.chainKey === 'tron-nile'
+          ? 'TRON_NILE_GRID_FALLBACK_URL'
+          : 'TRON_GRID_FALLBACK_URL',
+        '',
+      )
+      .trim();
+    const defaultGrid =
+      network.chainKey === 'tron-nile'
+        ? 'https://nile.trongrid.io'
+        : network.chainKey === 'tron-shasta'
+          ? 'https://api.shasta.trongrid.io'
+          : 'https://api.trongrid.io';
+    return [...new Set([configuredGrid, primary, fallback, explicitFallback, defaultGrid].filter(Boolean))];
   }
 
   private resolveTronGridBaseUrl(network: Network): string {

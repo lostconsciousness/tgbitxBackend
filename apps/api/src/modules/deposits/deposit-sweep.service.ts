@@ -578,11 +578,17 @@ export class DepositSweepService {
         },
       });
     } catch (error) {
+      const message = error instanceof Error ? error.message : 'unknown error';
+      if (/policy_violation|policy violation|not allowed by policy/i.test(message)) {
+        await this.block(
+          sweep.id,
+          `Privy policy rejected sweep before signing: ${message}`,
+        );
+        return;
+      }
       await this.block(
         sweep.id,
-        `Ambiguous Privy result; manual reconciliation required: ${
-          error instanceof Error ? error.message : 'unknown error'
-        }`,
+        `Ambiguous Privy result; manual reconciliation required: ${message}`,
       );
     }
   }
@@ -729,27 +735,8 @@ export class DepositSweepService {
     let amount = BigInt(sweep.rawAmount);
     const source = sweep.depositAddress.address;
 
-    if (isTrc20) {
-      const onChainBalance = await this.getTronTrc20BalanceRaw(
-        source,
-        target.tokenContract.address!,
-      );
-      if (onChainBalance <= 0n) {
-        await this.block(sweep.id, 'TRC20 balance is zero; manual deposit reconciliation required');
-        return;
-      }
-      if (onChainBalance < amount) {
-        amount = onChainBalance;
-        await this.prisma.depositSweep.update({
-          where: { id: sweep.id },
-          data: {
-            rawAmount: amount.toString(),
-            amount: formatUnits(amount, target.tokenContract.decimals),
-          },
-        });
-      }
-    }
-
+    // Confirm an already-broadcast transaction before reading the source
+    // balance: a successful sweep legitimately leaves the source at zero.
     if (sweep.status === DepositSweepStatus.BROADCASTED && sweep.txHash) {
       const confirmed = await this.confirmTronSweepTransaction(sweep.txHash);
       if (!confirmed.success) {
@@ -771,7 +758,33 @@ export class DepositSweepService {
       return;
     }
 
-    const feeReserveSun = BigInt(this.config.get<string>('TRON_SWEEP_FEE_RESERVE_SUN', '1000000'));
+    if (isTrc20) {
+      const onChainBalance = await this.getTronTrc20BalanceRaw(
+        source,
+        target.tokenContract.address!,
+      );
+      if (onChainBalance <= 0n) {
+        await this.block(sweep.id, 'TRC20 balance is zero; manual deposit reconciliation required');
+        return;
+      }
+      if (onChainBalance < amount) {
+        amount = onChainBalance;
+        await this.prisma.depositSweep.update({
+          where: { id: sweep.id },
+          data: {
+            rawAmount: amount.toString(),
+            amount: formatUnits(amount, target.tokenContract.decimals),
+          },
+        });
+      }
+    }
+
+    const nativeFeeReserveSun = BigInt(
+      this.config.get<string>('TRON_SWEEP_FEE_RESERVE_SUN', '1000000'),
+    );
+    const feeReserveSun = isTrc20
+      ? BigInt(this.config.get<string>('TRON_TRC20_SWEEP_FEE_RESERVE_SUN', '35000000'))
+      : nativeFeeReserveSun;
     const nativeBalance = await this.getTronNativeBalanceSun(source);
     const needsTrxTopUp = isTrc20
       ? nativeBalance < feeReserveSun
@@ -811,7 +824,6 @@ export class DepositSweepService {
           status: DepositSweepStatus.FUNDING_GAS,
           gasFundingTxHash: sent.txHash,
           gasFundingProviderRequestId: sent.providerRequestId,
-          attempts: { increment: 1 },
           startedAt: new Date(),
         },
       });
@@ -823,24 +835,39 @@ export class DepositSweepService {
       data: { status: DepositSweepStatus.BROADCASTING, attempts: { increment: 1 }, startedAt: new Date() },
     });
     const referenceId = this.buildSweepReferenceId('sweep', sweep.id, broadcasting.attempts);
-    const sent = isNative
-      ? await this.custody.sendTronNativeTransfer({
-          walletId: sweep.depositAddress.providerWalletRef,
-          fromAddress: source,
-          toAddress: treasuryAddress,
-          amountSun: Number(amount),
-          referenceId,
-          mainnet: true,
-        })
-      : await this.custody.sendTronTrc20Transfer({
-          walletId: sweep.depositAddress.providerWalletRef,
-          fromAddress: source,
-          toAddress: treasuryAddress,
-          contractAddress: target.tokenContract.address!,
-          rawAmount: amount,
-          referenceId,
-          mainnet: true,
-        });
+    let sent: { txHash: string; providerRequestId?: string };
+    try {
+      sent = isNative
+        ? await this.custody.sendTronNativeTransfer({
+            walletId: sweep.depositAddress.providerWalletRef,
+            fromAddress: source,
+            toAddress: treasuryAddress,
+            amountSun: Number(amount),
+            referenceId,
+            mainnet: true,
+          })
+        : await this.custody.sendTronTrc20Transfer({
+            walletId: sweep.depositAddress.providerWalletRef,
+            fromAddress: source,
+            toAddress: treasuryAddress,
+            contractAddress: target.tokenContract.address!,
+            rawAmount: amount,
+            referenceId,
+            feeLimitSun: Number(feeReserveSun),
+            mainnet: true,
+          });
+    } catch (error) {
+      // Nothing was broadcast, so keep the sweep retryable instead of leaving
+      // it in the in-flight state until the attempt limit is exhausted.
+      await this.prisma.depositSweep.update({
+        where: { id: sweep.id },
+        data: {
+          status: DepositSweepStatus.PENDING,
+          failureReason: (error instanceof Error ? error.message : 'Tron sweep failed').slice(0, 500),
+        },
+      });
+      throw error;
+    }
     await this.prisma.depositSweep.update({
       where: { id: sweep.id },
       data: {
@@ -853,67 +880,74 @@ export class DepositSweepService {
   }
 
   private async getTronNativeBalanceSun(address: string): Promise<bigint> {
-    const rpcUrl = this.config.get<string>('TRON_RPC_PRIMARY_URL', '').replace(/\/$/, '');
-    if (!rpcUrl) {
-      throw new ServiceUnavailableException('TRON_RPC_PRIMARY_URL is not configured');
+    try {
+      const body = await this.tronApiRequest<{
+        data?: Array<{ balance?: number | string }>;
+      }>(`/v1/accounts/${address}?only_confirmed=true`);
+      if (body.data?.[0]) return BigInt(body.data[0].balance ?? 0);
+    } catch (_error) {
+      // Fall through to the independent JSON-RPC read path.
     }
-    const response = await fetch(`${rpcUrl}/wallet/getaccount`, {
-      method: 'POST',
-      headers: this.tronApiHeaders(),
-      body: JSON.stringify({ address, visible: true }),
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!response.ok) {
-      throw new ServiceUnavailableException(`TRON API request failed: ${response.status}`);
-    }
-    const body = await response.json() as { balance?: number };
-    return BigInt(body.balance ?? 0);
+    return this.getTronNativeBalanceViaJsonRpc(address);
   }
 
   private async getTronTrc20BalanceRaw(
     address: string,
     contractAddress: string,
   ): Promise<bigint> {
-    const fullHost = this.config.get<string>('TRON_RPC_PRIMARY_URL', '').trim();
-    if (!fullHost) {
-      throw new ServiceUnavailableException('TRON_RPC_PRIMARY_URL is not configured');
+    const body = await this.tronApiRequest<{
+      data?: Array<{ trc20?: Array<Record<string, string>> }>;
+    }>(`/v1/accounts/${address}?only_confirmed=true`).catch(() => ({ data: [] }));
+    const expected = contractAddress.toLowerCase();
+    for (const entry of body.data?.[0]?.trc20 ?? []) {
+      const key = Object.keys(entry).find((candidate) => candidate.toLowerCase() === expected);
+      if (key) return BigInt(entry[key] ?? 0);
+    }
+    try {
+      return await this.getTronTrc20BalanceViaJsonRpc(address, contractAddress);
+    } catch (_error) {
+      // Continue with FullNode contract calls for installations without JSON-RPC.
     }
     const tronModule = await import('tronweb');
     const TronWebCtor = (tronModule as any).TronWeb ?? (tronModule as any).default;
-    const apiKey = this.config.get<string>('TRON_PRO_API_KEY', '').trim();
-    const tronWeb = new TronWebCtor({
-      fullHost,
-      ...(apiKey ? { headers: { 'TRON-PRO-API-KEY': apiKey } } : {}),
-    });
-    tronWeb.setAddress(address);
-    const contract = await tronWeb.contract().at(contractAddress);
-    return BigInt(String(await contract.balanceOf(address).call({ from: address })));
+    const keyedHeaders = this.tronApiHeaders();
+    const headerVariants = Object.hasOwn(keyedHeaders, 'TRON-PRO-API-KEY')
+      ? [keyedHeaders, { 'content-type': 'application/json' }]
+      : [keyedHeaders];
+    let lastError: unknown;
+    for (const fullHost of this.tronApiUrls()) {
+      for (const headers of headerVariants) {
+        try {
+          const tronWeb = new TronWebCtor({ fullHost, headers });
+          tronWeb.setAddress(address);
+          const contract = await tronWeb.contract().at(contractAddress);
+          return BigInt(String(await contract.balanceOf(address).call({ from: address })));
+        } catch (error) {
+          lastError = error;
+        }
+      }
+    }
+    throw new ServiceUnavailableException(
+      `TRON TRC20 balance request failed: ${lastError instanceof Error ? lastError.message : 'unavailable'}`,
+    );
   }
 
   private async confirmTronSweepTransaction(
     txHash: string,
   ): Promise<{ success: boolean; failed: boolean }> {
-    const rpcUrl = this.config.get<string>('TRON_RPC_PRIMARY_URL', '').replace(/\/$/, '');
-    if (!rpcUrl) {
-      return { success: false, failed: false };
-    }
-    const response = await fetch(`${rpcUrl}/wallet/gettransactioninfobyid`, {
-      method: 'POST',
-      headers: this.tronApiHeaders(),
-      body: JSON.stringify({ value: txHash }),
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!response.ok) {
-      throw new ServiceUnavailableException(`TRON API request failed: ${response.status}`);
-    }
-    const body = await response.json() as { id?: string; receipt?: { result?: string } };
+    const body = await this.tronApiRequest<{
+      id?: string;
+      receipt?: { result?: string };
+    }>('/wallet/gettransactioninfobyid', { value: txHash });
     if (!body.id) {
       return { success: false, failed: false };
     }
-    if (body.receipt?.result === 'REVERT') {
+    if (body.receipt?.result && body.receipt.result !== 'SUCCESS') {
       return { success: false, failed: true };
     }
-    return { success: body.receipt?.result === 'SUCCESS', failed: false };
+    // Confirmed native TRX transactions commonly omit receipt.result. A
+    // transaction-info id with no explicit failure is still a successful receipt.
+    return { success: true, failed: false };
   }
 
   private async getDepositAddressFamily(network: Chain): Promise<NetworkFamily | null> {
@@ -930,6 +964,113 @@ export class DepositSweepService {
       'content-type': 'application/json',
       ...(apiKey ? { 'TRON-PRO-API-KEY': apiKey } : {}),
     };
+  }
+
+  private async tronApiRequest<T>(path: string, body?: unknown): Promise<T> {
+    const apiKeyHeaders = this.tronApiHeaders();
+    const headers = Object.hasOwn(apiKeyHeaders, 'TRON-PRO-API-KEY')
+      ? [apiKeyHeaders, { 'content-type': 'application/json' }]
+      : [apiKeyHeaders];
+    const urls = this.tronApiUrls();
+    let lastStatus = 0;
+    for (const baseUrl of urls) {
+      for (const requestHeaders of headers) {
+        try {
+          const response = await fetch(`${baseUrl.replace(/\/$/, '')}${path}`, {
+            ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }),
+            headers: requestHeaders,
+            signal: AbortSignal.timeout(10_000),
+          });
+          if (response.ok) return response.json() as Promise<T>;
+          lastStatus = response.status;
+          if (![401, 403, 429].includes(response.status) && response.status < 500) {
+            throw new ServiceUnavailableException(`TRON API request failed: ${response.status}`);
+          }
+        } catch (error) {
+          if (error instanceof ServiceUnavailableException) throw error;
+        }
+      }
+    }
+    throw new ServiceUnavailableException(
+      `TRON API request failed on all configured endpoints: ${lastStatus || 'unavailable'}`,
+    );
+  }
+
+  private tronApiUrls(): string[] {
+    return [...new Set([
+      this.config.get<string>('TRON_RPC_PRIMARY_URL', '').trim(),
+      this.config.get<string>('TRON_RPC_FALLBACK_URL', '').trim(),
+      this.config.get<string>('TRON_GRID_API_URL', '').trim(),
+      this.config.get<string>('TRON_GRID_FALLBACK_URL', '').trim(),
+      this.config.get<string>('TRON_PUBLIC_FULLNODE_URL', '').trim(),
+      'https://api.trongrid.io',
+    ].filter(Boolean))];
+  }
+
+  private async getTronTrc20BalanceViaJsonRpc(
+    address: string,
+    contractAddress: string,
+  ): Promise<bigint> {
+    const tronModule = await import('tronweb');
+    const TronWebCtor = (tronModule as any).TronWeb ?? (tronModule as any).default;
+    const owner = String(TronWebCtor.address.toHex(address)).slice(2).padStart(64, '0');
+    const contract = `0x${String(TronWebCtor.address.toHex(contractAddress)).slice(2)}`;
+    const url = this.config.get<string>(
+      'TRON_JSON_RPC_URL',
+      'https://tron-rpc.publicnode.com/jsonrpc',
+    );
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'eth_call',
+        params: [{ to: contract, data: `0x70a08231${owner}` }, 'latest'],
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const result = await response.json().catch(() => ({})) as {
+      result?: string;
+      error?: { message?: string };
+    };
+    if (!response.ok || !result.result) {
+      throw new ServiceUnavailableException(
+        result.error?.message ?? `TRON JSON-RPC failed: ${response.status}`,
+      );
+    }
+    return BigInt(result.result);
+  }
+
+  private async getTronNativeBalanceViaJsonRpc(address: string): Promise<bigint> {
+    const tronModule = await import('tronweb');
+    const TronWebCtor = (tronModule as any).TronWeb ?? (tronModule as any).default;
+    const evmAddress = `0x${String(TronWebCtor.address.toHex(address)).slice(2)}`;
+    const url = this.config.get<string>(
+      'TRON_JSON_RPC_URL',
+      'https://tron-rpc.publicnode.com/jsonrpc',
+    );
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'eth_getBalance',
+        params: [evmAddress, 'latest'],
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const result = await response.json().catch(() => ({})) as {
+      result?: string;
+      error?: { message?: string };
+    };
+    if (!response.ok || !result.result) {
+      throw new ServiceUnavailableException(
+        result.error?.message ?? `TRON JSON-RPC failed: ${response.status}`,
+      );
+    }
+    return BigInt(result.result);
   }
 
   private async processSolanaSweep(sweep: {

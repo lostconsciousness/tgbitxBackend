@@ -347,22 +347,69 @@ export class LedgerService {
       .filter((chain): chain is Chain => chain !== null);
   }
 
-  async listUserSpotBalances(userId: string) {
+  async listUserSpotBalances(userId: string, options?: { mainnetOnly?: boolean }) {
     const accounts = await this.prisma.ledgerAccount.findMany({
       where: {
         userId,
         type: LedgerAccountType.USER_SPOT,
       },
-      include: { asset: true },
+      select: {
+        id: true,
+        assetId: true,
+        asset: {
+          select: {
+            id: true,
+            symbol: true,
+            name: true,
+            iconUrl: true,
+            type: true,
+            decimals: true,
+          },
+        },
+      },
       orderBy: { createdAt: 'asc' },
     });
+    if (accounts.length === 0) {
+      return [];
+    }
+    const entries = await this.prisma.ledgerEntry.findMany({
+      where: {
+        accountId: { in: accounts.map((account) => account.id) },
+        transaction: { status: 'POSTED' },
+      },
+      select: {
+        accountId: true,
+        assetId: true,
+        direction: true,
+        amount: true,
+      },
+    });
+    const entriesByAccount = new Map<string, typeof entries>();
+    for (const entry of entries) {
+      const bucket = entriesByAccount.get(entry.accountId) ?? [];
+      bucket.push(entry);
+      entriesByAccount.set(entry.accountId, bucket);
+    }
 
-    return Promise.all(
-      accounts.map(async (account) => ({
+    const visibleBalances = options?.mainnetOnly
+      ? new Map(await Promise.all(accounts.map(async (account) => ([
+          account.id,
+          await this.getUserMainnetSpotBalance({ userId, assetId: account.assetId }),
+        ] as const))))
+      : new Map(accounts.map((account) => ([
+          account.id,
+          calculateAccountBalance(entriesByAccount.get(account.id) ?? []),
+        ] as const)));
+
+    return accounts.map((account) => {
+      const balance = visibleBalances.get(account.id) ?? new Prisma.Decimal(0);
+      return {
         asset: account.asset,
-        balance: await this.getUserSpotBalance({ userId, assetId: account.assetId }),
-      })),
-    );
+        balance: balance.toString(),
+        available: balance.toString(),
+        total: balance.toString(),
+      };
+    });
   }
 
   async getTotalAccountTypeBalance(input: {

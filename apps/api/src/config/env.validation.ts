@@ -42,10 +42,33 @@ export const envValidationSchema = Joi.object({
   DEPOSIT_INTENT_TTL_SECONDS: Joi.number().integer().min(60).max(86_400).default(900),
   DEPOSIT_INDEXER_ENABLED: Joi.boolean().truthy('true').falsy('false').default(false),
   DEPOSIT_INDEXER_MAINNET_ONLY: Joi.boolean().truthy('true').falsy('false').default(false),
+  ALCHEMY_ADDRESS_ACTIVITY_ENABLED: Joi.boolean().truthy('true').falsy('false').default(false),
+  ALCHEMY_WEBHOOK_SIGNING_KEY: Joi.string().allow('').default(''),
+  ALCHEMY_WEBHOOK_SIGNING_KEYS_JSON: Joi.string().allow('').default(''),
+  ALCHEMY_WEBHOOK_AUTH_TOKEN: Joi.string().allow('').default(''),
+  ALCHEMY_WEBHOOK_IDS_JSON: Joi.string().allow('').default(''),
+  DEPOSIT_EVM_FALLBACK_SCAN_MS: Joi.number()
+    .integer()
+    .min(60_000)
+    .max(3_600_000)
+    .default(300_000),
+  DEPOSIT_EVM_BALANCE_RECONCILE_ENABLED: Joi.boolean()
+    .truthy('true')
+    .falsy('false')
+    .default(false),
   DEPOSIT_SWEEP_MAX_ATTEMPTS: Joi.number().integer().min(1).max(100).default(20),
   DEPOSIT_INDEXER_START_BLOCK: Joi.number().integer().min(0).default(0),
   DEPOSIT_INDEXER_MAX_BLOCK_RANGE: Joi.number().integer().min(1).max(10_000).default(250),
   DEPOSIT_INDEXER_RPC_PAUSE_MS: Joi.number().integer().min(0).max(5_000).default(0),
+  DEPOSIT_INDEXER_CONTRACT_TIMEOUT_MS: Joi.number().integer().min(5_000).max(120_000).default(20_000),
+  TRON_JSON_RPC_URL: Joi.string().uri({ scheme: ['https'] }).default('https://tron-rpc.publicnode.com/jsonrpc'),
+  TRON_PUBLIC_FULLNODE_URL: Joi.string().uri({ scheme: ['https'] }).default('https://tron-rpc.publicnode.com'),
+  TRON_TRC20_SWEEP_FEE_RESERVE_SUN: Joi.string().pattern(/^\d+$/).default('35000000'),
+  TRON_JSON_RPC_SCAN_BLOCKS: Joi.number().integer().min(10).max(128).default(100),
+  TRON_JSON_RPC_NATIVE_SCAN_BLOCKS: Joi.number().integer().min(10).max(128).default(60),
+  TRON_API_MAX_QPS: Joi.number().integer().min(1).max(8).default(8),
+  TRON_API_DAILY_BUDGET: Joi.number().integer().min(1_000).max(80_000).default(80_000),
+  TRON_SCAN_TIMESTAMP_OVERLAP_MS: Joi.number().integer().min(0).max(3_600_000).default(60_000),
   DEPOSIT_INDEXER_BALANCE_FALLBACK_ENABLED: Joi.boolean().default(true),
   DEPOSIT_INDEXER_REORG_OVERLAP_BLOCKS: Joi.number().integer().min(1).max(500).default(30),
   DEPOSIT_INDEXER_NATIVE_REORG_OVERLAP_BLOCKS: Joi.number().integer().min(1).max(30).default(2),
@@ -67,6 +90,8 @@ export const envValidationSchema = Joi.object({
   PRIVY_JWT_TTL_SECONDS: Joi.number().integer().min(60).max(900).default(300),
   PRIVY_CUSTODY_ENABLED: Joi.boolean().truthy('true').falsy('false').default(false),
   PRIVY_SERVER_WALLET_ID: Joi.string().allow('').default(''),
+  PRIVY_SPOT_LIQUIDITY_WALLET_ID: Joi.string().allow('').default(''),
+  PRIVY_SPOT_LIQUIDITY_POLICY_ID: Joi.string().allow('').default(''),
   PRIVY_AUTHORIZATION_PRIVATE_KEY_BASE64: Joi.string().allow('').default(''),
   PRIVY_AUTHORIZATION_PUBLIC_KEY: Joi.string().allow('').default(''),
   PRIVY_ENV_AUTHORIZATION_MAINNET_ENABLED: Joi.boolean().truthy('true').falsy('false').default(false),
@@ -80,6 +105,8 @@ export const envValidationSchema = Joi.object({
   TRON_SWEEP_FEE_RESERVE_SUN: Joi.string().pattern(/^\d+$/).default('1000000'),
   TRON_PRO_API_KEY: Joi.string().allow('').default(''),
   TRON_NILE_PRO_API_KEY: Joi.string().allow('').default(''),
+  TRON_GRID_FALLBACK_URL: Joi.string().allow('').uri({ scheme: ['https'] }).default(''),
+  TRON_NILE_GRID_FALLBACK_URL: Joi.string().allow('').uri({ scheme: ['https'] }).default(''),
   PRIVY_WEBHOOK_SIGNING_SECRET: Joi.string().allow('').default(''),
   PRIVY_DEPOSIT_SWEEP_POLICY_ID: Joi.string().allow('').default(''),
   PRIVY_SWEEP_GAS_WALLET_ID: Joi.string().allow('').default(''),
@@ -89,6 +116,10 @@ export const envValidationSchema = Joi.object({
   PRIVY_HYPERLIQUID_AGENT_WALLET_ID: Joi.string().allow('').default(''),
   PRIVY_HYPERLIQUID_AGENT_ADDRESS: Joi.string().allow('').default(''),
   PRIVY_HYPERLIQUID_AGENT_POLICY_ID: Joi.string().allow('').default(''),
+  PRIVY_PLATFORM_CAPITAL_WALLET_ID: Joi.string().allow('').default(''),
+  PRIVY_PLATFORM_CAPITAL_POLICY_ID: Joi.string().allow('').default(''),
+  PRIVY_INSURANCE_WALLET_ID: Joi.string().allow('').default(''),
+  PRIVY_INSURANCE_POLICY_ID: Joi.string().allow('').default(''),
   ARBITRUM_RPC_PRIMARY_URL: Joi.string().allow('').default(''),
   ARBITRUM_RPC_FALLBACK_URL: Joi.string().allow('').default(''),
   ETHEREUM_RPC_PRIMARY_URL: Joi.string().allow('').default(''),
@@ -223,12 +254,26 @@ export const envValidationSchema = Joi.object({
   HYPERLIQUID_TESTNET: Joi.boolean().truthy('true').falsy('false').default(true),
   HYPERLIQUID_EXECUTION_ENABLED: Joi.boolean().truthy('true').falsy('false').default(false),
   HYPERLIQUID_MIN_ACCOUNT_VALUE_USDC: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('25'),
+  HYPERLIQUID_MIN_WITHDRAWABLE_USDC: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('5'),
   PERP_MIN_ORDER_NOTIONAL_USDC: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('0'),
   PERP_MAX_ORDER_NOTIONAL_USDC: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('100'),
   PERP_MAX_LEVERAGE: Joi.number().integer().min(1).max(100).default(10),
   PROVIDER_RECONCILIATION_INTERVAL_MS: Joi.number().integer().min(1000).max(60000).default(5000),
   PROVIDER_RECONCILIATION_UNKNOWN_GRACE_MS: Joi.number().integer().min(30000).max(3600000).default(300000),
   PROVIDER_RECONCILIATION_MAX_ATTEMPTS: Joi.number().integer().min(1).max(100).default(20),
+  PROVIDER_RECONCILIATION_MANUAL_RECHECK_MS: Joi.number().integer().min(60_000).max(3_600_000).default(300_000),
+  HYPERLIQUID_RETRY_ATTEMPTS: Joi.number().integer().min(1).max(5).default(3),
+  HYPERLIQUID_RETRY_BASE_DELAY_MS: Joi.number().integer().min(50).max(5_000).default(250),
+  HYPERLIQUID_RETRY_MAX_DELAY_MS: Joi.number().integer().min(100).max(30_000).default(3_000),
+  HYPERLIQUID_CIRCUIT_FAILURE_THRESHOLD: Joi.number().integer().min(2).max(50).default(5),
+  HYPERLIQUID_CIRCUIT_COOLDOWN_MS: Joi.number().integer().min(1_000).max(300_000).default(15_000),
+  HYPERLIQUID_MARKET_DATA_BACKOFF_BASE_MS: Joi.number().integer().min(250).max(10_000).default(1_000),
+  HYPERLIQUID_MARKET_DATA_BACKOFF_MAX_MS: Joi.number().integer().min(1_000).max(300_000).default(30_000),
+  ACCOUNT_OVERVIEW_CACHE_MS: Joi.number().integer().min(0).max(60_000).default(5_000),
+  CONNECTED_WALLET_BALANCE_CACHE_MS: Joi.number().integer().min(1_000).max(300_000).default(120_000),
+  CONNECTED_WALLET_NETWORK_KEYS: Joi.string().allow('').default(''),
+  PRIVATE_WS_FALLBACK_SNAPSHOT_MS: Joi.number().integer().min(10_000).max(300_000).default(30_000),
+  PRIVATE_WS_EVENT_DEBOUNCE_MS: Joi.number().integer().min(0).max(1_000).default(25),
   MARKET_DATA_PROVIDER: Joi.string().valid('MOCK', 'HYPERLIQUID').default('MOCK'),
   MARKET_DATA_FALLBACK_TO_MOCK: Joi.boolean().truthy('true').falsy('false').default(true),
   ONEINCH_ENABLED: Joi.boolean().truthy('true').falsy('false').default(false),
@@ -238,10 +283,27 @@ export const envValidationSchema = Joi.object({
   ONEINCH_MIN_REQUEST_INTERVAL_MS: Joi.number().integer().min(1000).max(10000).default(1100),
   ONEINCH_MAX_RETRIES: Joi.number().integer().min(0).max(5).default(2),
   ONEINCH_SPENDER_CACHE_MS: Joi.number().integer().min(1000).max(3600000).default(300000),
+  ONEINCH_PRICE_CACHE_MS: Joi.number().integer().min(1000).max(300000).default(5000),
+  CONVERT_SPOT_TICKER_CACHE_MS: Joi.number().integer().min(1000).max(300000).default(15000),
+  CONVERT_ORDERBOOK_CACHE_MS: Joi.number().integer().min(5000).max(300000).default(30000),
+  CONVERT_ORDERBOOK_STREAM_MS: Joi.number().integer().min(1000).max(60000).default(5000),
   CONVERT_ENABLED: Joi.boolean().truthy('true').falsy('false').default(false),
   CONVERT_EVM_ENABLED: Joi.boolean().truthy('true').falsy('false').default(false),
-  CONVERT_EVM_NETWORKS: Joi.string().allow('').default('arbitrum,base,optimism,polygon,bnb,avalanche,ethereum,zksync,linea'),
+  CONVERT_SPOT_NETWORKS: Joi.string().default(
+    'arbitrum,bnb,base,optimism,ethereum',
+  ),
+  CONVERT_SPOT_CATALOG_CACHE_MS: Joi.number().integer().min(1000).max(300000).default(60000),
+  CONVERT_READINESS_CACHE_MS: Joi.number().integer().min(1000).max(300000).default(120000),
+  CONVERT_SPOT_CATALOG_MIN_STABLE_BALANCE: Joi.string()
+    .pattern(/^\d+(?:\.\d+)?$/)
+    .default('100'),
+  CONVERT_EVM_NETWORKS: Joi.string().allow('').default('arbitrum,bnb,base,optimism,ethereum'),
   CONVERT_EVM_GAS_RESERVE: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('0.00015'),
+  CONVERT_SPOT_GAS_RESERVE_ETHEREUM: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('0.02'),
+  CONVERT_SPOT_GAS_RESERVE_BNB: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('0.02'),
+  CONVERT_SPOT_GAS_RESERVE_ARBITRUM: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('0.005'),
+  CONVERT_SPOT_GAS_RESERVE_BASE: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('0.005'),
+  CONVERT_SPOT_GAS_RESERVE_OPTIMISM: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('0.005'),
   CONVERT_SOL_ENABLED: Joi.boolean().truthy('true').falsy('false').default(false),
   CONVERT_TRON_ENABLED: Joi.boolean().truthy('true').falsy('false').default(false),
   CONVERT_FEE_BPS: Joi.number().integer().min(0).max(300).default(20),
@@ -252,10 +314,23 @@ export const envValidationSchema = Joi.object({
   CONVERT_DAILY_LIMIT_USDC: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('1000'),
   CONVERT_RESERVE_COVERAGE_BPS: Joi.number().integer().min(10000).max(20000).default(11000),
   TRADING_PAUSED: Joi.boolean().truthy('true').falsy('false').default(false),
+  ABOOK_RECONCILIATION_PAUSED: Joi.boolean().truthy('true').falsy('false').default(false),
   BBOOK_ENABLED: Joi.boolean().truthy('true').falsy('false').default(false),
   BBOOK_PAUSED: Joi.boolean().truthy('true').falsy('false').default(false),
   PLATFORM_CAPITAL_USDC: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('0'),
   INSURANCE_CAPITAL_USDC: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('0'),
+  BBOOK_MIN_PLATFORM_CAPITAL_USDC: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('500'),
+  BBOOK_MIN_INSURANCE_CAPITAL_USDC: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('100'),
+  BBOOK_MAX_ORDER_CAPITAL_PCT: Joi.string().pattern(/^0(?:\.\d+)?$/).default('0.025'),
+  BBOOK_MAX_MARKET_EXPOSURE_PCT: Joi.string().pattern(/^0(?:\.\d+)?$/).default('0.10'),
+  BBOOK_MAX_TOTAL_EXPOSURE_PCT: Joi.string().pattern(/^0(?:\.\d+)?$/).default('0.25'),
+  BBOOK_MAX_UNREALIZED_LOSS_PCT: Joi.string().pattern(/^0(?:\.\d+)?$/).default('0.10'),
+  BBOOK_MAX_SPREAD_BPS: Joi.number().integer().min(1).max(500).default(50),
+  BBOOK_MIN_NOTIONAL_24H_USDC: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('1000000'),
+  BBOOK_MAX_MARK_DEVIATION_BPS: Joi.number().integer().min(1).max(1000).default(100),
+  BBOOK_MIN_DEPTH_MULTIPLIER: Joi.string().pattern(/^\d+(?:\.\d+)?$/).default('5'),
+  BBOOK_DEPTH_BPS: Joi.number().integer().min(1).max(500).default(30),
+  BBOOK_AUTO_PAUSE_DRAWDOWN_PCT: Joi.string().pattern(/^0(?:\.\d+)?$/).default('0.15'),
   ORDERBOOK_MAX_LEVELS: Joi.number().integer().min(1).max(100).default(25),
 }).custom((value, helpers) => {
   if (value.NODE_ENV === 'production') {
@@ -273,6 +348,71 @@ export const envValidationSchema = Joi.object({
   if (value.ONEINCH_ENABLED === true && !value.ONEINCH_API_KEY) {
     return helpers.error('any.invalid', {
       message: 'ONEINCH_API_KEY is required when ONEINCH_ENABLED=true',
+    });
+  }
+  if (
+    value.ALCHEMY_ADDRESS_ACTIVITY_ENABLED === true &&
+    !value.ALCHEMY_WEBHOOK_SIGNING_KEY &&
+    !value.ALCHEMY_WEBHOOK_SIGNING_KEYS_JSON
+  ) {
+    return helpers.error('any.invalid', {
+      message:
+        'ALCHEMY_WEBHOOK_SIGNING_KEY or ALCHEMY_WEBHOOK_SIGNING_KEYS_JSON is required when ALCHEMY_ADDRESS_ACTIVITY_ENABLED=true',
+    });
+  }
+  if (value.ALCHEMY_WEBHOOK_SIGNING_KEYS_JSON) {
+    try {
+      const keys = JSON.parse(value.ALCHEMY_WEBHOOK_SIGNING_KEYS_JSON) as Record<string, unknown>;
+      if (
+        !keys ||
+        Array.isArray(keys) ||
+        Object.keys(keys).length === 0 ||
+        Object.values(keys).some((key) => typeof key !== 'string' || key.length === 0)
+      ) {
+        return helpers.error('any.invalid', {
+          message: 'ALCHEMY_WEBHOOK_SIGNING_KEYS_JSON must map webhook IDs to signing keys',
+        });
+      }
+    } catch (_error) {
+      return helpers.error('any.invalid', {
+        message: 'ALCHEMY_WEBHOOK_SIGNING_KEYS_JSON must contain valid JSON',
+      });
+    }
+  }
+  if (value.ALCHEMY_WEBHOOK_IDS_JSON) {
+    try {
+      const ids = JSON.parse(value.ALCHEMY_WEBHOOK_IDS_JSON) as Record<string, unknown>;
+      const supported = ['ethereum', 'arbitrum', 'base', 'optimism', 'bnb'];
+      if (
+        !ids ||
+        Array.isArray(ids) ||
+        Object.keys(ids).length === 0 ||
+        Object.entries(ids).some(
+          ([network, id]) =>
+            !supported.includes(network) ||
+            typeof id !== 'string' ||
+            !id.startsWith('wh_'),
+        )
+      ) {
+        return helpers.error('any.invalid', {
+          message:
+            'ALCHEMY_WEBHOOK_IDS_JSON must map supported EVM network keys to webhook IDs',
+        });
+      }
+    } catch (_error) {
+      return helpers.error('any.invalid', {
+        message: 'ALCHEMY_WEBHOOK_IDS_JSON must contain valid JSON',
+      });
+    }
+  }
+  if (
+    value.NODE_ENV === 'production' &&
+    value.ALCHEMY_ADDRESS_ACTIVITY_ENABLED === true &&
+    (!value.ALCHEMY_WEBHOOK_AUTH_TOKEN || !value.ALCHEMY_WEBHOOK_IDS_JSON)
+  ) {
+    return helpers.error('any.invalid', {
+      message:
+        'ALCHEMY_WEBHOOK_AUTH_TOKEN and ALCHEMY_WEBHOOK_IDS_JSON are required for production webhook address synchronization',
     });
   }
   if (value.CONVERT_EVM_ENABLED === true && value.ONEINCH_ENABLED !== true) {

@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 
 @Injectable()
@@ -30,6 +31,30 @@ export class OperationalSettingsService {
       where: { key },
       update: { value },
       create: { key, value },
+    });
+  }
+
+  async getDecimalsByPrefix(prefix: string): Promise<Map<string, Prisma.Decimal>> {
+    const settings = await this.prisma.systemSetting.findMany({
+      where: { key: { startsWith: prefix } },
+    });
+    return new Map(
+      settings.map((setting) => {
+        const raw = setting.value;
+        if (typeof raw !== 'string' && typeof raw !== 'number') {
+          throw new Error(`Operational setting ${setting.key} must contain a decimal string`);
+        }
+        return [setting.key.slice(prefix.length), new Prisma.Decimal(raw)];
+      }),
+    );
+  }
+
+  setDecimal(key: string, value: Prisma.Decimal.Value) {
+    const normalized = new Prisma.Decimal(value).toString();
+    return this.prisma.systemSetting.upsert({
+      where: { key },
+      update: { value: normalized },
+      create: { key, value: normalized },
     });
   }
 }

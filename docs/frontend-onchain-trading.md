@@ -456,8 +456,12 @@ const socket = io(`${API_URL}/private`, {
 Required handling:
 
 - On `connect` and `reconnect`, emit `resync`.
-- Replace local `balances`, `orders`, `trades`, `positions`, and
-  `liquidations` with socket payloads.
+- Replace local `balances`, `orders`, `trades`, and `positions` with socket
+  payloads. Replace liquidation history only from `liquidations_snapshot`.
+- `liquidations_snapshot` is always an array and is not a notification. Never
+  show a toast merely because this event was received, including for `[]`.
+- Show a liquidation toast only for a singular `liquidation` occurrence event
+  (or after detecting a previously unseen completed event by its `id`).
 - If a mutation succeeds, still wait for socket/resync before final UI state.
 - Use `provider_status` to show degraded external execution status.
 - Use `risk_alert` to highlight near-liquidation positions.
@@ -496,7 +500,8 @@ withdrawals
 orders
 trades
 positions
-liquidations
+liquidations_snapshot
+liquidation
 provider_status
 risk_alert
 ```

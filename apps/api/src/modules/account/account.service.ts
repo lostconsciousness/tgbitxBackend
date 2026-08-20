@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleDestroy, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   Asset,
@@ -11,6 +11,7 @@ import {
   MarketType,
   Network,
   NetworkFamily,
+  PositionStatus,
   Prisma,
   TokenStandard,
   UserDepositAddress,
@@ -33,6 +34,7 @@ import {
 import { NonEvmTestnetAdapterService } from '../onchain/non-evm-testnet-adapter.service';
 import { buildWithdrawalFeeBreakdown } from '../withdrawals/withdrawal-fee.policy';
 import { PositionsService } from '../positions/positions.service';
+import { UserUpdatesService } from '../user-updates/user-updates.service';
 
 type OnChainBalanceSource = 'CONNECTED_WALLET' | 'PERSONAL_DEPOSIT_ADDRESS';
 
@@ -87,7 +89,8 @@ type OverviewResult = {
 };
 
 @Injectable()
-export class AccountService {
+export class AccountService implements OnModuleDestroy {
+  private readonly logger = new Logger(AccountService.name);
   private readonly overviewCache = new Map<string, { expiresAt: number; value: OverviewResult }>();
   private readonly depositOnChainCache = new Map<
     string,
@@ -97,6 +100,11 @@ export class AccountService {
       totalsByAssetId: Map<string, Prisma.Decimal>;
     }
   >();
+  private readonly connectedWalletBalancesCache = new Map<
+    string,
+    { expiresAt: number; value: Awaited<ReturnType<AccountService['loadConnectedWalletBalancesForUser']>> }
+  >();
+  private readonly unsubscribeUserUpdates?: () => void;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -107,14 +115,38 @@ export class AccountService {
     private readonly nonEvm: NonEvmTestnetAdapterService,
     private readonly config: ConfigService,
     private readonly positions: PositionsService,
-  ) {}
+    @Optional() private readonly userUpdates?: UserUpdatesService,
+  ) {
+    this.unsubscribeUserUpdates = this.userUpdates?.subscribe((update) => {
+      if (
+        update.kinds.has('balances') ||
+        update.kinds.has('orders') ||
+        update.kinds.has('positions')
+      ) {
+        this.invalidateOverviewCache(update.userId);
+      }
+      if (update.kinds.has('wallets')) {
+        this.connectedWalletBalancesCache.delete(update.userId);
+      }
+    });
+  }
+
+  onModuleDestroy(): void {
+    this.unsubscribeUserUpdates?.();
+  }
+
+  invalidateOverviewCache(userId: string): void {
+    this.overviewCache.delete(userId);
+  }
 
   async getOverview(userId: string): Promise<OverviewResult> {
     const cachedOverview = this.readOverviewCache(userId);
     if (cachedOverview) {
       return {
         ...cachedOverview,
-        positions: await this.positions.listUserPositions(userId),
+        positions: await this.positions.listUserPositions(userId, {
+          status: PositionStatus.OPEN,
+        }),
       };
     }
 
@@ -164,7 +196,7 @@ export class AccountService {
         include: { asset: true, tokenContract: { include: { network: true } } },
         orderBy: { createdAt: 'desc' },
       }),
-      this.positions.listUserPositions(userId),
+      this.positions.listUserPositions(userId, { status: PositionStatus.OPEN }),
     ]);
     const networkByLegacyChain = this.mapNetworksByLegacyChain(networks);
     const visibleNetworks = this.filterDisplayNetworks(networks);
@@ -299,6 +331,101 @@ export class AccountService {
   }
 
   async getConnectedWalletBalancesForUser(userId: string) {
+    const cached = this.connectedWalletBalancesCache.get(userId);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.value;
+    }
+    const value = await this.loadConnectedWalletBalancesForUser(userId);
+    this.connectedWalletBalancesCache.set(userId, {
+      expiresAt:
+        Date.now() +
+        this.config.get<number>('CONNECTED_WALLET_BALANCE_CACHE_MS', 120_000),
+      value,
+    });
+    return value;
+  }
+
+  async getConnectedWalletBalancesCompactForUser(userId: string) {
+    const entries = await this.getConnectedWalletBalancesForUser(userId);
+    return entries.map((entry) => ({
+      wallet: entry.wallet,
+      networks: entry.networks.map((networkEntry) => ({
+        network: networkEntry.network.network,
+        status: networkEntry.status,
+        assets: networkEntry.assets.map((asset) => ({
+          symbol: asset.symbol,
+          balance: asset.balance,
+          priceUsdc: asset.priceUsdc,
+          balanceUsdc: asset.balanceUsdc,
+          priceStatus: asset.priceStatus,
+          status: asset.status,
+        })),
+      })),
+      totalBalanceUsdc: entry.totalBalanceUsdc,
+      priceStatus: entry.priceStatus,
+    }));
+  }
+
+  async getPersonalDepositOnChainBalancesForUser(userId: string) {
+    const [networks, depositAddresses, assets] = await Promise.all([
+      this.prisma.network.findMany({ orderBy: { chainKey: 'asc' } }),
+      this.prisma.userDepositAddress.findMany({
+        where: { userId, status: UserDepositAddressStatus.ACTIVE },
+        orderBy: { createdAt: 'desc' },
+      }),
+      this.prisma.asset.findMany({
+        include: { tokenContracts: { include: { network: true } } },
+        orderBy: { symbol: 'asc' },
+      }),
+    ]);
+    const visibleNetworks = this.filterDisplayNetworks(networks);
+    const visibleNetworkKeys = new Set(visibleNetworks.map((network) => network.chainKey));
+    const displayAssets = this.filterDisplayAssets(assets);
+    const contracts = this.buildOnChainTokenContracts(displayAssets, visibleNetworkKeys);
+    const networkByLegacyChain = this.mapNetworksByLegacyChain(visibleNetworks);
+    const snapshot = await this.getPersonalDepositOnChainSnapshot({
+      userId,
+      depositAddresses,
+      tokenContracts: contracts,
+      networks: visibleNetworks,
+      displayAssets,
+    });
+
+    return snapshot.balances
+      .filter((target) => target.source === 'PERSONAL_DEPOSIT_ADDRESS')
+      .map((target) => ({
+        source: target.source,
+        depositAddressId: target.depositAddressId,
+        address: target.address,
+        network:
+          networkByLegacyChain.get(target.chain)?.chainKey ??
+          legacyChainToNetworkKey(target.chain),
+        status: target.status,
+        balances: target.balances
+          .filter((balance) =>
+            !this.isOperationalGasDustOnDepositAddress(target.source, balance),
+          )
+          .map((balance) => ({
+            assetId: 'id' in balance.asset ? balance.asset.id : undefined,
+            symbol: balance.asset.symbol,
+            balance: balance.balance,
+            status: balance.status,
+          })),
+      }))
+      .filter((target) => target.balances.length > 0);
+  }
+
+  async getPortfolioSummaryForUser(userId: string) {
+    const balances = await this.ledgerService.listUserSpotBalances(userId, {
+      mainnetOnly: this.isMainnetDisplayMode(),
+    });
+    const portfolio = await this.buildPortfolio(
+      balances.filter((balance) => new Prisma.Decimal(balance.total).greaterThan(0)),
+    );
+    return this.toPortfolioSummary(portfolio);
+  }
+
+  private async loadConnectedWalletBalancesForUser(userId: string) {
     const [networks, wallets, assets] = await Promise.all([
       this.prisma.network.findMany({
         orderBy: { chainKey: 'asc' },
@@ -312,7 +439,7 @@ export class AccountService {
         orderBy: { symbol: 'asc' },
       }),
     ]);
-    const visibleNetworks = this.filterDisplayNetworks(networks);
+    const visibleNetworks = this.filterConnectedWalletNetworks(networks);
     const visibleNetworkKeys = new Set(visibleNetworks.map((network) => network.chainKey));
     const tokenContracts = this.buildOnChainTokenContracts(assets, visibleNetworkKeys);
 
@@ -512,14 +639,7 @@ export class AccountService {
           const network = networkByKey.get(target.networkKey);
           const [nativeBalance, tokenBalances] =
             network?.family === NetworkFamily.EVM || !network
-              ? await Promise.all([
-                  this.getNativeBalance(target),
-                  Promise.all(
-                    networkContracts
-                      .filter((contract) => contract.address)
-                      .map((contract) => this.getTokenBalance(target, contract)),
-                  ),
-                ])
+              ? await this.getEvmBalances(target, networkContracts)
               : await Promise.all([
                   Promise.resolve(null),
                   Promise.all(
@@ -750,12 +870,27 @@ export class AccountService {
       };
     }
 
-    const balances = await this.getOnChainBalances({
-      wallets: [],
-      depositAddresses: input.depositAddresses,
-      tokenContracts: input.tokenContracts,
-      networks: input.networks,
-    });
+    let balances: Awaited<ReturnType<AccountService['getOnChainBalances']>>;
+    try {
+      balances = await this.getOnChainBalances({
+        wallets: [],
+        depositAddresses: input.depositAddresses,
+        tokenContracts: input.tokenContracts,
+        networks: input.networks,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Deposit balance snapshot degraded for ${input.userId}: ${
+          error instanceof Error ? error.message : 'unknown error'
+        }`,
+      );
+      return cached
+        ? {
+            balances: cached.balances,
+            totalsByAssetId: cached.totalsByAssetId,
+          }
+        : empty;
+    }
     const totalsByAssetId = this.getPersonalDepositOnChainTotalsByAssetId(
       balances,
       input.displayAssets,
@@ -949,6 +1084,20 @@ export class AccountService {
       return networks;
     }
     return networks.filter((network) => network.mainnet);
+  }
+
+  private filterConnectedWalletNetworks(networks: Network[]) {
+    const configuredKeys = new Set(
+      (this.config.get<string>('CONNECTED_WALLET_NETWORK_KEYS', '') ?? '')
+        .split(',')
+        .map((key) => key.trim().toLowerCase())
+        .filter(Boolean),
+    );
+    return this.filterDisplayNetworks(networks).filter((network) => {
+      if (!network.legacyChain || !this.isNetworkAdapterEnabled(network)) return false;
+      if (configuredKeys.size > 0) return configuredKeys.has(network.chainKey.toLowerCase());
+      return network.depositEnabled || network.withdrawalEnabled;
+    });
   }
 
   private filterDisplayAssets<
@@ -1386,14 +1535,7 @@ export class AccountService {
         const network = networkByKey.get(target.networkKey);
         const [nativeBalance, tokenBalances] =
           network?.family === NetworkFamily.EVM || !network
-            ? await Promise.all([
-          this.getNativeBalance(target),
-          Promise.all(
-                  networkContracts
-                    .filter((contract) => contract.address)
-                    .map((contract) => this.getTokenBalance(target, contract)),
-                ),
-              ])
+            ? await this.getEvmBalances(target, networkContracts)
             : await Promise.all([
                 Promise.resolve(null),
                 Promise.all(
@@ -1461,6 +1603,77 @@ export class AccountService {
     }
   }
 
+  private async getEvmBalances(
+    target: OnChainBalanceTarget,
+    contracts: OnChainTokenContract[],
+  ): Promise<[
+    Awaited<ReturnType<AccountService['getNativeBalance']>>,
+    Array<Awaited<ReturnType<AccountService['getTokenBalance']>>>,
+  ]> {
+    const tokenContracts = contracts.filter(
+      (contract): contract is OnChainTokenContract & { address: string } =>
+        Boolean(contract.address),
+    );
+    if (!this.rpcProvider.getBalances) {
+      return Promise.all([
+        this.getNativeBalance(target),
+        Promise.all(tokenContracts.map((contract) => this.getTokenBalance(target, contract))),
+      ]);
+    }
+    try {
+      const balances = await this.rpcProvider.getBalances(
+        target.address,
+        [
+          {},
+          ...tokenContracts.map((contract) => ({
+            token: contract.address,
+            tokenDecimals: contract.decimals,
+          })),
+        ],
+        target.networkKey,
+      );
+      const native = balances[0];
+      if (!native) throw new Error('Multicall native balance is missing');
+      const nativeBalance = {
+        asset: {
+          symbol: nativeGasSymbol(target.networkKey),
+          name: nativeGasSymbol(target.networkKey),
+          iconUrl: null,
+          type: 'NATIVE',
+          chain: target.chain,
+          decimals: 18,
+          tokenStandard: 'NATIVE',
+          tokenAddress: null,
+        },
+        balance: formatUnits(BigInt(native.value), 18),
+        rawBalance: native.value,
+        status: 'AVAILABLE' as const,
+      };
+      const tokenBalances = tokenContracts.map((contract, index) => ({
+        asset: {
+          id: contract.asset.id,
+          symbol: contract.asset.symbol,
+          name: contract.asset.name,
+          iconUrl: contract.asset.iconUrl,
+          type: contract.asset.type,
+          chain: target.chain,
+          decimals: contract.asset.decimals,
+          tokenStandard: contract.standard,
+          tokenAddress: contract.address,
+        },
+        balance: balances[index + 1]?.value ?? null,
+        rawBalance: null,
+        status: balances[index + 1] ? ('AVAILABLE' as const) : ('UNAVAILABLE' as const),
+      }));
+      return [nativeBalance, tokenBalances];
+    } catch (_error) {
+      return Promise.all([
+        this.getNativeBalance(target),
+        Promise.all(tokenContracts.map((contract) => this.getTokenBalance(target, contract))),
+      ]);
+    }
+  }
+
   private async getTokenBalance(target: OnChainBalanceTarget, contract: OnChainTokenContract) {
     if (!contract.address) {
       return null;
@@ -1513,30 +1726,45 @@ export class AccountService {
     contract: OnChainTokenContract,
     network: Network,
   ) {
-    const result = await this.nonEvm.getBalance({
-      network,
-      tokenContract: {
-        standard: contract.standard as TokenStandard,
-        address: contract.address,
-        decimals: contract.decimals,
-      },
-      address: target.address,
-    });
-    return {
-      asset: {
-        id: contract.asset.id,
-        symbol: contract.asset.symbol,
-        name: contract.asset.name,
-        iconUrl: contract.asset.iconUrl,
-        type: contract.asset.type,
-        chain: target.chain,
-        decimals: contract.asset.decimals,
-        tokenStandard: contract.standard,
-        tokenAddress: contract.address,
-      },
-      balance: result.balance,
-      rawBalance: result.rawBalance,
-      status: result.status,
+    const asset = {
+      id: contract.asset.id,
+      symbol: contract.asset.symbol,
+      name: contract.asset.name,
+      iconUrl: contract.asset.iconUrl,
+      type: contract.asset.type,
+      chain: target.chain,
+      decimals: contract.asset.decimals,
+      tokenStandard: contract.standard,
+      tokenAddress: contract.address,
     };
+    try {
+      const result = await this.nonEvm.getBalance({
+        network,
+        tokenContract: {
+          standard: contract.standard as TokenStandard,
+          address: contract.address,
+          decimals: contract.decimals,
+        },
+        address: target.address,
+      });
+      return {
+        asset,
+        balance: result.balance,
+        rawBalance: result.rawBalance,
+        status: result.status,
+      };
+    } catch (error) {
+      this.logger.warn(
+        `Non-EVM balance unavailable for ${network.chainKey}/${contract.asset.symbol}: ${
+          error instanceof Error ? error.message : 'unknown error'
+        }`,
+      );
+      return {
+        asset,
+        balance: null,
+        rawBalance: null,
+        status: 'UNAVAILABLE' as const,
+      };
+    }
   }
 }

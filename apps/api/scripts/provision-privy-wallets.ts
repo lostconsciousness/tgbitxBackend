@@ -37,6 +37,36 @@ async function main(): Promise<void> {
         ownerPublicKey: authorizationPublicKey(),
       })
     : null;
+  const capitalPolicyId = process.env.PRIVY_PLATFORM_CAPITAL_POLICY_ID;
+  const insurancePolicyId = process.env.PRIVY_INSURANCE_POLICY_ID;
+  const spotLiquidityPolicyId = process.env.PRIVY_SPOT_LIQUIDITY_POLICY_ID;
+  const spotLiquidity = spotLiquidityPolicyId
+    ? await createWallet({
+        displayName: 'Spot liquidity reserve',
+        externalId: 'spot_liquidity_reserve',
+        idempotencyKey: 'dream-exchange-spot-liquidity-v1',
+        policyId: spotLiquidityPolicyId,
+        ownerPublicKey: authorizationPublicKey(),
+      })
+    : null;
+  const platformCapital = capitalPolicyId
+    ? await createWallet({
+        displayName: 'B-book platform capital',
+        externalId: 'bbook_platform_capital',
+        idempotencyKey: 'dream-exchange-bbook-platform-capital-v1',
+        policyId: capitalPolicyId,
+        ownerPublicKey: authorizationPublicKey(),
+      })
+    : null;
+  const insurance = insurancePolicyId
+    ? await createWallet({
+        displayName: 'B-book insurance reserve',
+        externalId: 'bbook_insurance_reserve',
+        idempotencyKey: 'dream-exchange-bbook-insurance-v1',
+        policyId: insurancePolicyId,
+        ownerPublicKey: authorizationPublicKey(),
+      })
+    : null;
 
   console.log('');
   console.log('Privy wallets created or recovered by idempotency key.');
@@ -52,6 +82,20 @@ async function main(): Promise<void> {
   } else {
     console.log('');
     console.log('Sweep gas wallet skipped: set PRIVY_SWEEP_GAS_POLICY_ID first.');
+  }
+  if (platformCapital && insurance) {
+    console.log(`PRIVY_PLATFORM_CAPITAL_WALLET_ID=${platformCapital.id}`);
+    console.log(`PLATFORM_CAPITAL_ADDRESS=${platformCapital.address}`);
+    console.log(`PRIVY_INSURANCE_WALLET_ID=${insurance.id}`);
+    console.log(`INSURANCE_ADDRESS=${insurance.address}`);
+  } else {
+    console.log('B-book custody wallets skipped: set both capital/insurance policy IDs first.');
+  }
+  if (spotLiquidity) {
+    console.log(`PRIVY_SPOT_LIQUIDITY_WALLET_ID=${spotLiquidity.id}`);
+    console.log(`SPOT_LIQUIDITY_ADDRESS=${spotLiquidity.address}`);
+  } else {
+    console.log('Spot liquidity wallet skipped: set PRIVY_SPOT_LIQUIDITY_POLICY_ID first.');
   }
   console.log('');
   console.log('The app secret was not printed or persisted by this script.');

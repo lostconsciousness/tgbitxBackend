@@ -1,0 +1,77 @@
+name: Deploy backend to production
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to deploy
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - name: Checkout selected ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Configure production SSH
+        env:
+          DEPLOY_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.PRODUCTION_SSH_KNOWN_HOSTS }}
+        run: |
+          test -n "$DEPLOY_KEY"
+          test -n "$KNOWN_HOSTS"
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Upload versioned source without production secrets
+        env:
+          HOST: ${{ secrets.PRODUCTION_HOST }}
+          USER: ${{ secrets.PRODUCTION_USER }}
+        run: |
+          test -n "$HOST"
+          test -n "$USER"
+          rsync -az --delete \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='.env*' \
+            --exclude='apps/api/.env*' \
+            --exclude='backups/' \
+            --exclude='node_modules/' \
+            --exclude='**/dist/' \
+            ./ "$USER@$HOST:/opt/tgbitx/backend/"
+
+      - name: Backup, migrate, deploy and verify
+        env:
+          HOST: ${{ secrets.PRODUCTION_HOST }}
+          USER: ${{ secrets.PRODUCTION_USER }}
+          REVISION: ${{ github.sha }}
+        run: |
+          ssh "$USER@$HOST" "cd /opt/tgbitx/backend && \
+            mkdir -p backups/cicd && \
+            docker-compose -f compose.production.yml exec -T postgres sh -lc 'pg_dump -U \"\$POSTGRES_USER\" \"\$POSTGRES_DB\"' > backups/cicd/predeploy-$REVISION.sql && \
+            docker-compose -f compose.production.yml build api && \
+            docker-compose -f compose.production.yml run --rm api npm run migrate:deploy && \
+            (docker-compose -f compose.production.yml up -d --no-deps api || \
+              (docker ps -aq --filter label=com.docker.compose.service=api | xargs -r docker rm -f && \
+               docker-compose -f compose.production.yml up -d --no-deps api)) && \
+            for attempt in 1 2 3 4 5 6; do \
+              sleep 5; \
+              curl -fsS http://127.0.0.1:3000/health/ready && exit 0; \
+            done; \
+            exit 1"

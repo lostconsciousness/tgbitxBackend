@@ -4,6 +4,7 @@ import {
   Chain,
   LedgerEntryDirection,
   NetworkFamily,
+  Prisma,
   TokenStandard,
   WithdrawalStatus,
 } from '@prisma/client';
@@ -192,6 +193,55 @@ describe('WithdrawalsService', () => {
         confirmWithdrawal: jest.fn(),
       } as never,
     );
+  });
+
+  it('fails and releases an underfunded Tron withdrawal before broadcast', async () => {
+    const withdrawal = {
+      id: 'withdrawal-tron-underfunded',
+      network: Chain.TRON,
+      status: WithdrawalStatus.APPROVED,
+      approvedAt: new Date(),
+      broadcastAttempts: 0,
+      amount: new Prisma.Decimal('270'),
+      asset: { id: 'asset-usdt', symbol: 'USDT' },
+      tokenContract: {
+        id: 'contract-usdt-tron',
+        standard: TokenStandard.TRC20,
+        address: 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t',
+        decimals: 6,
+        network: {
+          id: 'network-tron',
+          chainKey: 'tron',
+          family: NetworkFamily.TVM,
+          legacyChain: Chain.TRON,
+          mainnet: true,
+        },
+      },
+    };
+    (prisma as any).withdrawal.findMany = jest.fn().mockResolvedValue([withdrawal]);
+    (prisma as any).custodyAccount = {
+      findFirst: jest.fn().mockResolvedValue({
+        address: 'TWwMthsyR2ZfxEKUKQXB4bfRdUaxCKpDbS',
+      }),
+    };
+    const nonEvm = (service as any).nonEvm;
+    nonEvm.assertSupportedNetwork = jest.fn();
+    nonEvm.getBalance = jest.fn().mockResolvedValue({
+      balance: '204.72873',
+      rawBalance: '204728730',
+      status: 'AVAILABLE',
+    });
+    const failAndRelease = jest
+      .spyOn(service as any, 'failAndRelease')
+      .mockResolvedValue(undefined);
+
+    await (service as any).broadcastNextApproved();
+
+    expect(failAndRelease).toHaveBeenCalledWith(
+      withdrawal.id,
+      expect.stringContaining('available 204.72873, requested 270'),
+    );
+    expect(nonEvm.sendWithdrawal).not.toHaveBeenCalled();
   });
 
   it('returns unified exchange balance with per-network withdrawal options', async () => {

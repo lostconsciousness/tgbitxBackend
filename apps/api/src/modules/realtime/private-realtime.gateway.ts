@@ -1,4 +1,4 @@
-import { Logger } from '@nestjs/common';
+import { Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import {
@@ -17,6 +17,10 @@ import { PrismaService } from '../../database/prisma.service';
 import { HyperliquidExecutionService } from '../hyperliquid/hyperliquid-execution.service';
 import { PositionsService } from '../positions/positions.service';
 import { Prisma } from '@prisma/client';
+import {
+  UserUpdate,
+  UserUpdatesService,
+} from '../user-updates/user-updates.service';
 
 type AuthenticatedSocket = Socket & {
   data: {
@@ -30,13 +34,16 @@ type AuthenticatedSocket = Socket & {
   cors: { origin: true, credentials: true },
 })
 export class PrivateRealtimeGateway
-  implements OnGatewayConnection, OnGatewayDisconnect
+  implements OnGatewayConnection, OnGatewayDisconnect, OnModuleInit, OnModuleDestroy
 {
   @WebSocketServer()
   private server!: Server;
 
   private readonly logger = new Logger(PrivateRealtimeGateway.name);
   private readonly timers = new Map<string, NodeJS.Timeout>();
+  private readonly userUpdateTimers = new Map<string, NodeJS.Timeout>();
+  private readonly pendingUserUpdates = new Map<string, Set<string>>();
+  private unsubscribeUserUpdates?: () => void;
 
   constructor(
     private readonly jwt: JwtService,
@@ -46,7 +53,23 @@ export class PrivateRealtimeGateway
     private readonly prisma: PrismaService,
     private readonly hyperliquid: HyperliquidExecutionService,
     private readonly positions: PositionsService,
+    private readonly userUpdates: UserUpdatesService,
   ) {}
+
+  onModuleInit(): void {
+    this.unsubscribeUserUpdates = this.userUpdates.subscribe((update) =>
+      this.queueUserUpdate(update),
+    );
+  }
+
+  onModuleDestroy(): void {
+    this.unsubscribeUserUpdates?.();
+    for (const timer of this.timers.values()) clearInterval(timer);
+    for (const timer of this.userUpdateTimers.values()) clearTimeout(timer);
+    this.timers.clear();
+    this.userUpdateTimers.clear();
+    this.pendingUserUpdates.clear();
+  }
 
   async handleConnection(client: AuthenticatedSocket): Promise<void> {
     try {
@@ -70,10 +93,14 @@ export class PrivateRealtimeGateway
       client.data.userId = payload.sub;
       client.data.sessionId = payload.sid;
       await client.join(`user:${payload.sub}`);
-      await this.emitSnapshot(client);
+      this.logger.log(`Private socket connected: ${client.id}`);
+      await this.emitSnapshotSafely(client, 'initial');
       const timer = setInterval(
-        () => void this.emitSnapshot(client),
-        this.config.get<number>('PRIVATE_WS_SNAPSHOT_MS', 2_000),
+        () => void this.emitSnapshotSafely(client, 'fallback'),
+        Math.max(
+          10_000,
+          this.config.get<number>('PRIVATE_WS_FALLBACK_SNAPSHOT_MS', 30_000),
+        ),
       );
       this.timers.set(client.id, timer);
     } catch (error) {
@@ -92,36 +119,140 @@ export class PrivateRealtimeGateway
       clearInterval(timer);
     }
     this.timers.delete(client.id);
+    this.logger.log(`Private socket disconnected: ${client.id}`);
   }
 
   @SubscribeMessage('resync')
   async resync(@ConnectedSocket() client: AuthenticatedSocket) {
-    await this.emitSnapshot(client);
-    return { ok: true };
+    return { ok: await this.emitSnapshotSafely(client, 'client-resync') };
   }
 
   emitToUser(userId: string, event: string, payload: unknown): void {
     if (!this.server) {
       return;
     }
-    this.server.to(`user:${userId}`).emit(event, payload);
+    this.server.to(`user:${userId}`).emit(event, this.toRealtimePayload(payload));
+  }
+
+  private emitToClient(
+    client: AuthenticatedSocket,
+    event: string,
+    payload: unknown,
+  ): void {
+    client.emit(event, this.toRealtimePayload(payload));
+  }
+
+  private toRealtimePayload(payload: unknown): unknown {
+    const serialized = JSON.stringify(
+      payload,
+      (_key, value) => typeof value === 'bigint' ? value.toString() : value,
+    );
+    return serialized === undefined ? null : JSON.parse(serialized);
   }
 
   async notifyUserBalancesUpdated(userId: string): Promise<void> {
-    if (!this.server) {
-      return;
+    this.userUpdates.publish(userId, ['balances', 'deposits']);
+  }
+
+  private queueUserUpdate(update: UserUpdate): void {
+    const kinds = this.pendingUserUpdates.get(update.userId) ?? new Set<string>();
+    for (const kind of update.kinds) kinds.add(kind);
+    this.pendingUserUpdates.set(update.userId, kinds);
+    if (this.userUpdateTimers.has(update.userId)) return;
+    const timer = setTimeout(() => {
+      this.userUpdateTimers.delete(update.userId);
+      const pending = this.pendingUserUpdates.get(update.userId) ?? new Set<string>();
+      this.pendingUserUpdates.delete(update.userId);
+      void this.emitUserUpdate(update.userId, pending).catch((error) =>
+        this.logger.warn(
+          `Realtime user update failed for ${update.userId}: ${
+            error instanceof Error ? error.message : 'unknown error'
+          }`,
+        ),
+      );
+    }, this.config.get<number>('PRIVATE_WS_EVENT_DEBOUNCE_MS', 25));
+    this.userUpdateTimers.set(update.userId, timer);
+  }
+
+  private async emitUserUpdate(userId: string, kinds: Set<string>): Promise<void> {
+    if (!this.server) return;
+    this.account.invalidateOverviewCache(userId);
+    const failedSections: string[] = [];
+    const tasks: Promise<void>[] = [];
+    const emitWhenReady = <T>(
+      section: string,
+      operation: Promise<T>,
+      emit: (value: T) => void,
+    ) => {
+      tasks.push(
+        operation
+          .then(emit)
+          .catch(() => {
+            failedSections.push(section);
+          }),
+      );
+    };
+    if (kinds.has('balances')) {
+      emitWhenReady('overview', this.account.getOverview(userId), (overview) => {
+        this.emitToUser(userId, 'balances', overview.balances);
+        this.emitToUser(userId, 'portfolio', overview.portfolio);
+      });
     }
-    const [overview, deposits] = await Promise.all([
-      this.account.getOverview(userId),
-      this.prisma.deposit.findMany({
-        where: { userId },
-        orderBy: { createdAt: 'desc' },
-        take: 20,
-      }),
-    ]);
-    this.emitToUser(userId, 'balances', overview.balances);
-    this.emitToUser(userId, 'portfolio', overview.portfolio);
-    this.emitToUser(userId, 'deposits', deposits);
+    if (kinds.has('orders')) {
+      emitWhenReady(
+        'orders',
+        this.prisma.order.findMany({
+          where: { userId },
+          include: { market: true, providerOrder: true, trades: true },
+          orderBy: { createdAt: 'desc' },
+          take: 50,
+        }),
+        (orders) => this.emitToUser(userId, 'orders', orders),
+      );
+    }
+    if (kinds.has('positions')) {
+      emitWhenReady(
+        'positions',
+        this.positions.listUserPositions(userId, { includeLiveMarks: false }),
+        (positions) => this.emitToUser(userId, 'positions', positions),
+      );
+    }
+    if (kinds.has('trades')) {
+      emitWhenReady(
+        'trades',
+        this.prisma.trade.findMany({
+          where: { userId },
+          orderBy: { executedAt: 'desc' },
+          take: 50,
+        }),
+        (trades) => this.emitToUser(userId, 'trades', trades),
+      );
+    }
+    if (kinds.has('deposits')) {
+      emitWhenReady(
+        'deposits',
+        this.prisma.deposit.findMany({
+          where: { userId },
+          orderBy: { createdAt: 'desc' },
+          take: 20,
+        }),
+        (deposits) => this.emitToUser(userId, 'deposits', deposits),
+      );
+    }
+    await Promise.all(tasks);
+    if (failedSections.length > 0) {
+      this.logger.warn(
+        `Partial realtime update for ${userId}; failed sections: ${failedSections.join(', ')}`,
+      );
+      this.emitToUser(userId, 'snapshot_partial', {
+        sections: failedSections,
+        retryable: true,
+      });
+    }
+    this.emitToUser(userId, 'account_updated', {
+      kinds: [...kinds],
+      occurredAt: new Date().toISOString(),
+    });
   }
 
   private async emitSnapshot(client: AuthenticatedSocket): Promise<void> {
@@ -129,17 +260,8 @@ export class PrivateRealtimeGateway
     if (!userId || !client.connected) {
       return;
     }
-    const [
-      overview,
-      deposits,
-      withdrawals,
-      orders,
-      trades,
-      positions,
-      liquidations,
-    ] =
-      await Promise.all([
-        this.account.getOverview(userId),
+    const results = await Promise.allSettled([
+      this.account.getOverview(userId),
         this.prisma.deposit.findMany({
           where: { userId },
           orderBy: { createdAt: 'desc' },
@@ -152,6 +274,7 @@ export class PrivateRealtimeGateway
         }),
         this.prisma.order.findMany({
           where: { userId },
+          include: { market: true, providerOrder: true, trades: true },
           orderBy: { createdAt: 'desc' },
           take: 50,
         }),
@@ -160,25 +283,54 @@ export class PrivateRealtimeGateway
           orderBy: { executedAt: 'desc' },
           take: 50,
         }),
-        this.positions.listUserPositions(userId),
+        this.positions.listUserPositions(userId, { includeLiveMarks: false }),
         this.prisma.liquidationEvent.findMany({
           where: { position: { userId } },
           orderBy: { triggeredAt: 'desc' },
           take: 20,
         }),
-      ]);
-    client.emit('balances', overview.balances);
-    client.emit('portfolio', overview.portfolio);
-    client.emit('deposits', deposits);
-    client.emit('withdrawals', withdrawals);
-    client.emit('orders', orders);
-    client.emit('trades', trades);
-    client.emit('positions', positions);
-    client.emit('liquidations', liquidations);
-    client.emit('provider_status', {
+    ] as const);
+    const [
+      overviewResult,
+      depositsResult,
+      withdrawalsResult,
+      ordersResult,
+      tradesResult,
+      positionsResult,
+      liquidationsResult,
+    ] = results;
+    if (overviewResult.status === 'fulfilled') {
+      this.emitToClient(client, 'balances', overviewResult.value.balances);
+      this.emitToClient(client, 'portfolio', overviewResult.value.portfolio);
+    }
+    if (depositsResult.status === 'fulfilled') {
+      this.emitToClient(client, 'deposits', depositsResult.value);
+    }
+    if (withdrawalsResult.status === 'fulfilled') {
+      this.emitToClient(client, 'withdrawals', withdrawalsResult.value);
+    }
+    if (ordersResult.status === 'fulfilled') {
+      this.emitToClient(client, 'orders', ordersResult.value);
+    }
+    if (tradesResult.status === 'fulfilled') {
+      this.emitToClient(client, 'trades', tradesResult.value);
+    }
+    if (positionsResult.status === 'fulfilled') {
+      this.emitToClient(client, 'positions', positionsResult.value);
+    }
+    // This payload is a state snapshot, not a newly-triggered liquidation.
+    // Keep it on a separate event so clients cannot accidentally show a
+    // liquidation toast for an empty array or replay historical events after
+    // every reconnect/fallback snapshot. A real liquidation notification must
+    // use the singular `liquidation` event at the point it is committed.
+    if (liquidationsResult.status === 'fulfilled') {
+      this.emitToClient(client, 'liquidations_snapshot', liquidationsResult.value);
+    }
+    this.emitToClient(client, 'provider_status', {
       hyperliquidExecutionEnabled: this.hyperliquid.isExecutionEnabled(),
       marketDataProvider: this.config.get<string>('MARKET_DATA_PROVIDER', 'MOCK'),
     });
+    const positions = positionsResult.status === 'fulfilled' ? positionsResult.value : [];
     const nearLiquidation = positions.filter((position) => {
       if (position.status !== 'OPEN' || !position.maintenanceMargin) {
         return false;
@@ -188,10 +340,50 @@ export class PrivateRealtimeGateway
         .lessThanOrEqualTo(new Prisma.Decimal(position.maintenanceMargin).mul('1.5'));
     });
     if (nearLiquidation.length > 0) {
-      client.emit('risk_alert', {
+      this.emitToClient(client, 'risk_alert', {
         type: 'NEAR_LIQUIDATION',
         positions: nearLiquidation.map((position) => position.id),
       });
+    }
+    const sectionNames = [
+      'overview',
+      'deposits',
+      'withdrawals',
+      'orders',
+      'trades',
+      'positions',
+      'liquidations',
+    ];
+    const failedSections = results.flatMap((result, index) =>
+      result.status === 'rejected' ? [sectionNames[index]!] : [],
+    );
+    if (failedSections.length > 0) {
+      this.logger.warn(
+        `Partial private snapshot for ${client.id}; failed sections: ${failedSections.join(', ')}`,
+      );
+      this.emitToClient(client, 'snapshot_partial', {
+        sections: failedSections,
+        retryable: true,
+      });
+    }
+  }
+
+  private async emitSnapshotSafely(
+    client: AuthenticatedSocket,
+    reason: string,
+  ): Promise<boolean> {
+    try {
+      await this.emitSnapshot(client);
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'unknown error';
+      this.logger.warn(
+        `Private socket snapshot failed (${reason}) for ${client.id}: ${message}`,
+      );
+      if (client.connected) {
+        client.emit('snapshot_error', { reason, retryable: true });
+      }
+      return false;
     }
   }
 }

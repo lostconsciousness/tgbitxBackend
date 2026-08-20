@@ -6,6 +6,7 @@ import {
   DepositChannel,
   DepositStatus,
   NetworkFamily,
+  Prisma,
   TokenStandard,
 } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
@@ -21,6 +22,39 @@ const assetValuationMock = {} as AssetValuationService;
 const nonEvmMock = {} as never;
 
 describe('DepositsService', () => {
+  it('retries a serializable deposit write conflict without double crediting', async () => {
+    const existingDeposit = { id: 'deposit-existing', status: DepositStatus.CREDITED };
+    const prisma = {
+      $transaction: jest.fn()
+        .mockRejectedValueOnce(new Prisma.PrismaClientKnownRequestError(
+          'Transaction failed due to a write conflict',
+          { code: 'P2034', clientVersion: 'test' },
+        ))
+        .mockResolvedValueOnce(existingDeposit),
+    };
+    const service = new DepositsService(
+      prisma as unknown as PrismaService,
+      {} as AssetsService,
+      {} as WalletsService,
+      {} as LedgerService,
+      {} as ConfigService,
+      {} as RpcProvider,
+      {} as DepositAddressService,
+      assetValuationMock,
+      nonEvmMock,
+    );
+
+    await expect(service.recordDetectedDeposit({
+      assetId: 'asset-usdt',
+      toAddress: 'TDeposit',
+      txHash: 'tron-tx',
+      logIndex: 0,
+      amount: '50',
+      confirmations: 20,
+    })).resolves.toBe(existingDeposit);
+    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+  });
+
   it('reverses and hides a previously credited internal sweep gas transfer', async () => {
     const gasAddress = '0x1111111111111111111111111111111111111111';
     const creditedDeposit = {
@@ -480,6 +514,75 @@ describe('DepositsService', () => {
     });
   });
 
+  it('rejects a Tron intent created with an EVM wallet', async () => {
+    const tronNetwork = {
+      ...network,
+      id: 'network-tron',
+      chainKey: 'tron',
+      caip2: 'tron:mainnet',
+      chainId: null,
+      family: NetworkFamily.TVM,
+      legacyChain: Chain.TRON,
+      mainnet: true,
+    };
+    const tronContract = {
+      ...tokenContract,
+      id: 'contract-usdt-tron',
+      address: 'TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj',
+      standard: TokenStandard.TRC20,
+      network: tronNetwork,
+    };
+    const provision = jest.fn();
+    const prisma = {
+      network: { findUnique: jest.fn().mockResolvedValue(tronNetwork) },
+      tokenContract: { findUnique: jest.fn().mockResolvedValue(tronContract) },
+      wallet: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'wallet-evm',
+          userId: 'user-1',
+          address: '0x1111111111111111111111111111111111111111',
+          chain: Chain.ETHEREUM,
+          status: 'ACTIVE',
+        }),
+      },
+      $transaction: jest.fn(),
+    };
+    const service = new DepositsService(
+      prisma as unknown as PrismaService,
+      {
+        getBySymbol: jest.fn().mockResolvedValue({
+          id: 'asset-usdt',
+          symbol: 'USDT',
+          decimals: 6,
+          depositEnabled: true,
+        }),
+      } as unknown as AssetsService,
+      {} as WalletsService,
+      {} as LedgerService,
+      {
+        get: jest.fn((key: string, fallback?: unknown) =>
+          key === 'MAINNET_ENABLED' ? true : fallback,
+        ),
+      } as unknown as ConfigService,
+      {} as RpcProvider,
+      { provision } as unknown as DepositAddressService,
+      assetValuationMock,
+      nonEvmMock,
+    );
+
+    await expect(service.createIntent({
+      userId: 'user-1',
+      walletId: 'wallet-evm',
+      assetSymbol: 'USDT',
+      amount: '10',
+      network: 'tron',
+    })).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'DEPOSIT_WALLET_NETWORK_MISMATCH' }),
+    });
+    expect(provision).not.toHaveBeenCalled();
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
   it('lists enabled native deposit options without contract verification', async () => {
     const assetValuation = {
       enrichAndSortByBalanceUsdc: jest.fn(
@@ -721,9 +824,11 @@ describe('DepositsService', () => {
       depositIntent: {
         findFirst: jest.fn().mockResolvedValue(intent),
         update: jest.fn().mockResolvedValue({ ...intent, status: 'SUBMITTED', txHash }),
+        findUniqueOrThrow: jest.fn().mockResolvedValue({ ...intent, status: 'DETECTED', txHash }),
       },
       deposit: {
         findUnique: jest.fn().mockResolvedValue(null),
+        findFirst: jest.fn().mockResolvedValue(null),
         create: jest.fn().mockResolvedValue({
           id: 'deposit-1',
           status: DepositStatus.DETECTED,
@@ -760,7 +865,7 @@ describe('DepositsService', () => {
                 '0x0000000000000000000000001111111111111111111111111111111111111111',
                 '0x0000000000000000000000002222222222222222222222222222222222222222',
               ],
-              data: '0x000000000000000000000000000000000000000000000000000000000f4240',
+              data: '0x00000000000000000000000000000000000000000000000000000000000f4240',
             },
           ],
         }),
@@ -770,6 +875,10 @@ describe('DepositsService', () => {
       assetValuationMock,
       nonEvmMock,
     );
+    jest.spyOn(service, 'recordDetectedDeposit').mockResolvedValue({
+      id: 'deposit-1',
+      status: DepositStatus.PENDING_CONFIRMATION,
+    } as never);
 
     await expect(
       service.submitIntent({
@@ -777,7 +886,7 @@ describe('DepositsService', () => {
         intentId: intent.id,
         txHash,
       }),
-    ).resolves.toEqual(expect.objectContaining({ status: 'SUBMITTED', txHash }));
+    ).resolves.toEqual(expect.objectContaining({ txHash }));
   });
 
   it('returns the personal deposit address and accepts any sender', async () => {

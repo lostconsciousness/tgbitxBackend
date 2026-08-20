@@ -83,6 +83,7 @@ export class DepositsService {
     if (!wallet) {
       throw new BadRequestException('Active deposit wallet was not found');
     }
+    this.assertWalletSupportsNetwork(wallet.chain, network.family);
 
     const personalAddress = await this.depositAddresses.provision(
       input.userId,
@@ -219,6 +220,9 @@ export class DepositsService {
       if (log.transactionHash.toLowerCase() !== input.txHash.toLowerCase()) {
         return false;
       }
+      if (log.address.toLowerCase() !== intent.tokenContract!.address!.toLowerCase()) {
+        return false;
+      }
       try {
         const parsed = decodeEventLog({
           abi: [TRANSFER_EVENT],
@@ -284,6 +288,42 @@ export class DepositsService {
       where: { id: intent.id },
       include: { asset: true, wallet: true, deposit: true },
     });
+  }
+
+  private assertWalletSupportsNetwork(
+    walletChain: Chain,
+    networkFamily: NetworkFamily,
+  ): void {
+    const nonEvmChains = new Set<Chain>([
+      Chain.SOLANA,
+      Chain.SOLANA_DEVNET,
+      Chain.BITCOIN,
+      Chain.BITCOIN_SIGNET,
+      Chain.TRON,
+      Chain.TRON_NILE,
+      Chain.TRON_SHASTA,
+    ]);
+    const svmChains = new Set<Chain>([Chain.SOLANA, Chain.SOLANA_DEVNET]);
+    const utxoChains = new Set<Chain>([Chain.BITCOIN, Chain.BITCOIN_SIGNET]);
+    const tronChains = new Set<Chain>([
+      Chain.TRON,
+      Chain.TRON_NILE,
+      Chain.TRON_SHASTA,
+    ]);
+    const compatible =
+      networkFamily === NetworkFamily.EVM
+        ? !nonEvmChains.has(walletChain)
+        : networkFamily === NetworkFamily.SVM
+          ? svmChains.has(walletChain)
+          : networkFamily === NetworkFamily.UTXO
+            ? utxoChains.has(walletChain)
+            : tronChains.has(walletChain);
+    if (!compatible) {
+      throw new BadRequestException({
+        code: 'DEPOSIT_WALLET_NETWORK_MISMATCH',
+        message: `Selected wallet does not support ${networkFamily} deposits`,
+      });
+    }
   }
 
   private async submitNativeIntent(input: {
@@ -714,6 +754,45 @@ export class DepositsService {
     });
   }
 
+  async listActiveIntents(userId: string) {
+    const intents = await this.prisma.depositIntent.findMany({
+      where: {
+        userId,
+        status: {
+          in: [
+            DepositIntentStatus.PENDING,
+            DepositIntentStatus.SUBMITTED,
+            DepositIntentStatus.DETECTED,
+            DepositIntentStatus.CONFIRMED,
+          ],
+        },
+      },
+      select: {
+        id: true,
+        walletId: true,
+        network: true,
+        fromAddress: true,
+        treasuryAddress: true,
+        amount: true,
+        rawAmount: true,
+        txHash: true,
+        status: true,
+        expiresAt: true,
+        createdAt: true,
+        updatedAt: true,
+        asset: {
+          select: { id: true, symbol: true, decimals: true },
+        },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 50,
+    });
+    return intents.map((intent) => ({
+      ...intent,
+      amount: intent.amount.toString(),
+    }));
+  }
+
   listAdminDeposits(take = 100) {
     return this.prisma.deposit.findMany({
       take: Math.min(take, 200),
@@ -816,6 +895,18 @@ export class DepositsService {
       }
     }
     return reclassified;
+  }
+
+  async isInternalTronSweepGasFunding(input: {
+    txHash: string;
+    fromAddress?: string;
+  }): Promise<boolean> {
+    const linkedSweep = await this.prisma.depositSweep.findFirst({
+      where: { gasFundingTxHash: input.txHash },
+      select: { id: true },
+    });
+    if (linkedSweep) return true;
+    return this.nonEvm.isTronTreasuryTransfer(input.fromAddress);
   }
 
   async shouldSkipInternalPersonalDepositTransfer(input: {
@@ -979,11 +1070,27 @@ export class DepositsService {
     blockNumber?: number;
     amount: string;
     confirmations: number;
+    forceUnmatched?: boolean;
   }) {
-    return this.prisma.$transaction(
-      (tx) => this.recordDetectedDepositInTransaction(input, tx),
-      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
-    );
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        return await this.prisma.$transaction(
+          (tx) => this.recordDetectedDepositInTransaction(input, tx),
+          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+        );
+      } catch (error) {
+        if (!this.isRetryableDepositWriteConflict(error) || attempt === maxAttempts) {
+          throw error;
+        }
+      }
+    }
+    throw new Error('Deposit transaction retry loop exhausted unexpectedly');
+  }
+
+  private isRetryableDepositWriteConflict(error: unknown): boolean {
+    return error instanceof Prisma.PrismaClientKnownRequestError &&
+      (error.code === 'P2034' || error.code === 'P2002');
   }
 
   private async recordDetectedDepositInTransaction(
@@ -1004,6 +1111,7 @@ export class DepositsService {
       blockNumber?: number;
       amount: string;
       confirmations: number;
+      forceUnmatched?: boolean;
     },
     client: Prisma.TransactionClient,
   ) {
@@ -1017,7 +1125,9 @@ export class DepositsService {
       where: {
         network,
         txHash: input.txHash,
-        logIndex: input.logIndex ?? null,
+        ...(network === Chain.TRON && input.logIndex === undefined
+          ? { OR: [{ logIndex: null }, { logIndex: 0 }] }
+          : { logIndex: input.logIndex ?? null }),
       },
       include: { asset: true },
     });
@@ -1139,7 +1249,9 @@ export class DepositsService {
       input.tokenContractId ?? intent?.tokenContractId,
       client,
     );
-    const matchedUserId = intent?.userId ?? depositAddress?.userId ?? input.userId;
+    const matchedUserId = input.forceUnmatched
+      ? undefined
+      : intent?.userId ?? depositAddress?.userId ?? input.userId;
     const status = this.resolveInitialDepositStatus({
       hasUser: Boolean(matchedUserId),
       confirmations: input.confirmations,
@@ -1156,7 +1268,9 @@ export class DepositsService {
         tokenContractId: input.tokenContractId ?? intent?.tokenContractId,
         network: intent?.network ?? network,
         channel:
-          input.channel ??
+          input.forceUnmatched
+            ? DepositChannel.UNMATCHED
+            : input.channel ??
           (intent
             ? DepositChannel.WEB3_INTENT
             : depositAddress
@@ -1172,7 +1286,7 @@ export class DepositsService {
         amount: new Prisma.Decimal(input.amount),
         rawAmount: input.rawAmount ?? intent?.rawAmount,
         confirmations: input.confirmations,
-        status,
+        status: input.forceUnmatched ? DepositStatus.UNMATCHED : status,
         idempotencyKey,
       },
       include: { asset: true },
@@ -1182,7 +1296,7 @@ export class DepositsService {
       await this.syncIntentStatus(client, input.intentId, deposit);
     }
 
-    if (status === DepositStatus.DETECTED) {
+    if (!input.forceUnmatched && status === DepositStatus.DETECTED) {
       return this.creditDepositInTransaction(deposit.id, client);
     }
 
@@ -1445,6 +1559,7 @@ export class DepositsService {
     withdrawalEnabled: boolean;
     withdrawalFeeAmount: { toString(): string };
     minWithdrawalAmount: { toString(): string };
+    minDepositAmount?: { toString(): string };
     contractVerifiedAt: Date | null;
     contractCodeHash: string | null;
     verifiedChainId: number | null;
@@ -1512,6 +1627,7 @@ export class DepositsService {
       disabledReason,
       requiredConfirmations: contract.network.confirmations,
       withdrawalFeeAmount: contract.withdrawalFeeAmount.toString(),
+      minDepositAmount: contract.minDepositAmount?.toString() ?? '0',
       minWithdrawalAmount: contract.minWithdrawalAmount.toString(),
       contractVerified,
       verifiedChainId: contract.verifiedChainId,

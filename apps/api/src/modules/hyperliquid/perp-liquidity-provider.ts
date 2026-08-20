@@ -43,6 +43,7 @@ export type ProviderReadiness = {
   ready: boolean;
   reasons: string[];
   accountValue?: string;
+  withdrawable?: string;
   masterAddressConfigured: boolean;
   agentAddressConfigured: boolean;
   agentRegistered: boolean;

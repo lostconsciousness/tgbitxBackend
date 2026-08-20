@@ -59,6 +59,10 @@ export class HyperliquidMarketDataProvider implements OnModuleDestroy {
   private readonly subscribers = new Map<string, Set<Subscriber>>();
   private readonly cache = new Map<string, OrderBookSnapshot>();
   private readonly refreshTimers = new Map<string, NodeJS.Timeout>();
+  private readonly refreshFailures = new Map<string, number>();
+  private readonly nextRefreshAt = new Map<string, number>();
+  private infoFailures = 0;
+  private infoCircuitOpenUntil = 0;
   private socket?: WebSocket;
   private reconnectTimer?: NodeJS.Timeout;
   private reconnectAttempts = 0;
@@ -278,6 +282,7 @@ export class HyperliquidMarketDataProvider implements OnModuleDestroy {
       this.stopRefreshLoop(providerSymbol);
       return;
     }
+    if ((this.nextRefreshAt.get(providerSymbol) ?? 0) > Date.now()) return;
 
     try {
       const snapshot = await this.getOrderBook({
@@ -285,12 +290,24 @@ export class HyperliquidMarketDataProvider implements OnModuleDestroy {
         providerSymbol,
       });
       this.broadcast(providerSymbol, snapshot);
+      this.refreshFailures.delete(providerSymbol);
+      this.nextRefreshAt.delete(providerSymbol);
     } catch (error) {
-      this.logger.warn(
-        `Failed to refresh ${providerSymbol} order book: ${
-          error instanceof Error ? error.message : 'unknown error'
-        }`,
+      const failures = (this.refreshFailures.get(providerSymbol) ?? 0) + 1;
+      this.refreshFailures.set(providerSymbol, failures);
+      const base = this.config.get<number>('HYPERLIQUID_MARKET_DATA_BACKOFF_BASE_MS', 1_000);
+      const max = this.config.get<number>('HYPERLIQUID_MARKET_DATA_BACKOFF_MAX_MS', 30_000);
+      this.nextRefreshAt.set(
+        providerSymbol,
+        Date.now() + Math.min(max, base * 2 ** Math.min(failures - 1, 6)),
       );
+      if (failures === 1 || (failures & (failures - 1)) === 0) {
+        this.logger.warn(
+          `Failed to refresh ${providerSymbol} order book (${failures} consecutive): ${
+            error instanceof Error ? error.message : 'unknown error'
+          }`,
+        );
+      }
     }
   }
 
@@ -331,6 +348,9 @@ export class HyperliquidMarketDataProvider implements OnModuleDestroy {
   }
 
   private async postInfo<T>(body: unknown): Promise<T> {
+    if (this.infoCircuitOpenUntil > Date.now()) {
+      throw new MarketDataUnavailableException('Hyperliquid market-data circuit is open');
+    }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5_000);
 
@@ -346,8 +366,17 @@ export class HyperliquidMarketDataProvider implements OnModuleDestroy {
         throw new MarketDataUnavailableException(`Hyperliquid returned HTTP ${response.status}`);
       }
 
-      return (await response.json()) as T;
+      const result = (await response.json()) as T;
+      this.infoFailures = 0;
+      this.infoCircuitOpenUntil = 0;
+      return result;
     } catch (error) {
+      this.infoFailures += 1;
+      const threshold = this.config.get<number>('HYPERLIQUID_CIRCUIT_FAILURE_THRESHOLD', 5);
+      if (this.infoFailures >= threshold) {
+        this.infoCircuitOpenUntil =
+          Date.now() + this.config.get<number>('HYPERLIQUID_CIRCUIT_COOLDOWN_MS', 15_000);
+      }
       if (error instanceof MarketDataUnavailableException) {
         throw error;
       }

@@ -5,9 +5,10 @@ import { TreasuryModule } from '../treasury/treasury.module';
 import { HyperliquidModule } from '../hyperliquid/hyperliquid.module';
 import { OrdersModule } from '../orders/orders.module';
 import { SettingsModule } from '../settings/settings.module';
+import { AuditModule } from '../audit/audit.module';
 
 @Module({
-  imports: [TreasuryModule, HyperliquidModule, OrdersModule, SettingsModule],
+  imports: [TreasuryModule, HyperliquidModule, OrdersModule, SettingsModule, AuditModule],
   controllers: [ReconciliationController],
   providers: [ReconciliationService],
   exports: [ReconciliationService],

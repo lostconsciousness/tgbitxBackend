@@ -47,6 +47,43 @@ describe('DepositAddressService', () => {
     }),
   } as unknown as ConfigService;
 
+  it('lists compact per-network addresses without token metadata', async () => {
+    const service = new DepositAddressService(
+      {
+        userDepositAddress: {
+          findMany: jest.fn().mockResolvedValue([{
+            id: 'address-1',
+            network: Chain.ARBITRUM,
+            address: '0x1111111111111111111111111111111111111111',
+            status: UserDepositAddressStatus.ACTIVE,
+            createdAt: new Date('2026-08-20T00:00:00Z'),
+          }]),
+        },
+        network: {
+          findMany: jest.fn().mockResolvedValue([{
+            chainKey: 'arbitrum',
+            legacyChain: Chain.ARBITRUM,
+            family: NetworkFamily.EVM,
+          }]),
+        },
+      } as unknown as PrismaService,
+      {} as AssetsService,
+      {} as PrivyCustodyService,
+      {} as AuditService,
+      config,
+      {} as never,
+      {} as never,
+    );
+
+    await expect(service.listUser('user-1')).resolves.toEqual([{
+      id: 'address-1',
+      network: 'arbitrum',
+      address: '0x1111111111111111111111111111111111111111',
+      status: UserDepositAddressStatus.ACTIVE,
+      createdAt: new Date('2026-08-20T00:00:00Z'),
+    }]);
+  });
+
   it('returns an active address without creating another Privy wallet', async () => {
     const custody = { createOrGetWallet: jest.fn() };
     const service = new DepositAddressService(
@@ -70,6 +107,7 @@ describe('DepositAddressService', () => {
       {} as AuditService,
       config,
       {} as never,
+      { trackAddress: jest.fn() } as never,
     );
 
     const result = await service.provision('user-1', 'USDC');
@@ -110,6 +148,7 @@ describe('DepositAddressService', () => {
       { record: jest.fn() } as unknown as AuditService,
       config,
       {} as never,
+      { trackAddress: jest.fn() } as never,
     );
 
     const result = await service.provision('user-1', 'USDC');
@@ -163,6 +202,7 @@ describe('DepositAddressService', () => {
       { record: jest.fn() } as unknown as AuditService,
       config,
       {} as never,
+      { trackAddress: jest.fn() } as never,
     );
 
     const result = await service.provision('user-1', 'USDC');

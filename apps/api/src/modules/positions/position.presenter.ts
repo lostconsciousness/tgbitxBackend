@@ -3,6 +3,8 @@ import { MarketType, Prisma } from '@prisma/client';
 type PositionMarket = {
   symbol: string;
   type: MarketType;
+  pricePrecision: number;
+  sizePrecision: number;
   baseAsset?: { symbol: string } | null;
   quoteAsset?: { symbol: string } | null;
 };
@@ -55,6 +57,17 @@ export function presentPosition(
     live?.unrealizedPnl ?? new Prisma.Decimal(position.unrealizedPnl.toString());
   const baseAsset = resolveBaseAssetSymbol(position.market);
   const quoteAsset = resolveQuoteAssetSymbol(position.market);
+  const maximumDisplayPrecision = new Prisma.Decimal(position.entryPrice.toString())
+    .abs()
+    .greaterThanOrEqualTo('0.001')
+    ? 5
+    : 8;
+  const displayPricePrecision = baseAsset === 'BTC'
+    ? 0
+    : Math.max(0, Math.min(maximumDisplayPrecision, position.market.pricePrecision));
+  const exitPrice = position.status === 'CLOSED'
+    ? position.markPrice.toString()
+    : null;
 
   return {
     id: position.id,
@@ -67,8 +80,12 @@ export function presentPosition(
     size: size.toString(),
     baseAsset,
     quoteAsset,
+    pricePrecision: position.market.pricePrecision,
+    sizePrecision: position.market.sizePrecision,
+    displayPricePrecision,
     notionalUsdc: size.mul(markPrice).toString(),
     entryPrice: position.entryPrice.toString(),
+    exitPrice,
     markPrice: markPrice.toString(),
     liquidationPrice: position.liquidationPrice.toString(),
     leverage: position.leverage,

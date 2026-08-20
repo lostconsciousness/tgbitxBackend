@@ -26,4 +26,21 @@ describe('DepositsController', () => {
     });
   });
 
+  it('loads addresses and intents from separate lightweight routes', async () => {
+    const depositsService = { listActiveIntents: jest.fn().mockResolvedValue([]) };
+    const depositAddressService = { listUser: jest.fn().mockResolvedValue([]) };
+    const controller = new DepositsController(
+      depositsService as unknown as DepositsService,
+      {} as DepositIndexerService,
+      {} as AuditService,
+      depositAddressService as unknown as DepositAddressService,
+      {} as DepositSweepService,
+    );
+
+    await expect(controller.listDepositAddresses({ id: 'user-1' } as any)).resolves.toEqual([]);
+    await expect(controller.listIntents({ id: 'user-1' } as any)).resolves.toEqual([]);
+    expect(depositAddressService.listUser).toHaveBeenCalledWith('user-1');
+    expect(depositsService.listActiveIntents).toHaveBeenCalledWith('user-1');
+  });
+
 });

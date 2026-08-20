@@ -105,6 +105,23 @@ type PrivyReadClient = {
   };
 };
 
+type TronUnsignedTransaction = {
+  txID?: string;
+  raw_data_hex: string;
+  raw_data: {
+    contract: Array<{
+      type: string;
+      parameter?: { value?: Record<string, unknown> };
+    }>;
+    fee_limit?: number;
+    expiration?: number;
+    ref_block_bytes?: string;
+    ref_block_hash?: string;
+    timestamp?: number;
+  };
+  signature?: string[];
+};
+
 @Injectable()
 export class PrivyCustodyService {
   constructor(private readonly config: ConfigService) {}
@@ -280,7 +297,9 @@ export class PrivyCustodyService {
     );
     return this.sendTronTransaction({
       walletId: input.walletId,
-      rawData: this.mapTronWebRawData(unsigned.raw_data),
+      transaction: unsigned as TronUnsignedTransaction,
+      fromAddress: input.fromAddress,
+      tronWeb,
       referenceId: input.referenceId,
       mainnet: input.mainnet,
     });
@@ -310,13 +329,20 @@ export class PrivyCustodyService {
       ],
       input.fromAddress,
     );
-    const rawData = this.mapTronWebRawData(
-      unsigned.raw_data ?? unsigned.transaction?.raw_data ?? unsigned,
-    );
-    rawData.fee_limit = feeLimit;
+    const transaction = (unsigned.transaction ?? unsigned) as TronUnsignedTransaction;
+    this.assertTronTrc20Transfer({
+      transaction,
+      fromAddress: input.fromAddress,
+      toAddress: input.toAddress,
+      contractAddress: input.contractAddress,
+      rawAmount: input.rawAmount,
+      tronWeb,
+    });
     return this.sendTronTransaction({
       walletId: input.walletId,
-      rawData,
+      transaction,
+      fromAddress: input.fromAddress,
+      tronWeb,
       referenceId: input.referenceId,
       mainnet: input.mainnet,
     });
@@ -361,7 +387,9 @@ export class PrivyCustodyService {
   }
 
   async sendTronTransaction(input: {
-    rawData: Record<string, unknown>;
+    transaction: TronUnsignedTransaction;
+    fromAddress: string;
+    tronWeb?: any;
     referenceId: string;
     walletId?: string;
     mainnet?: boolean;
@@ -373,21 +401,87 @@ export class PrivyCustodyService {
     const walletId =
       input.walletId ?? this.config.getOrThrow<string>('PRIVY_TRON_WALLET_ID');
     const client = await this.createClient();
+    const wallet = await client.wallets().get(walletId);
+    if (!wallet.address || wallet.address !== input.fromAddress) {
+      throw new ServiceUnavailableException('Privy Tron wallet address does not match transaction owner');
+    }
+    if (!/^[0-9a-f]+$/i.test(input.transaction.raw_data_hex ?? '') ||
+        input.transaction.raw_data_hex.length % 2 !== 0) {
+      throw new ServiceUnavailableException('Tron transaction raw_data_hex is missing or invalid');
+    }
+    const tronWeb = input.tronWeb ?? await this.createTronWebClient(input.mainnet !== false);
+    const rawData = this.toPrivyTronRawData(input.transaction, input.fromAddress, tronWeb);
     const response = await client.wallets().rpc(walletId, {
       method: 'tron_sendTransaction',
-      caip2: input.mainnet === false ? 'tron:nile' : 'tron:mainnet',
-      idempotency_key: input.referenceId,
+      params: {
+        raw_data: rawData,
+        reference_id: input.referenceId,
+      },
+      idempotency_key: `${input.referenceId}:send`,
       authorization_context: {
         authorization_private_keys: [this.getAuthorizationPrivateKey()],
       },
-      params: {
-        raw_data: input.rawData,
-        reference_id: input.referenceId,
-      },
     });
+    const txHash = response.data.hash;
+    if (!txHash || !/^[0-9a-f]{64}$/i.test(txHash)) {
+      throw new ServiceUnavailableException('Privy Tron broadcast did not return a valid transaction hash');
+    }
     return {
-      txHash: response.data.hash,
-      providerRequestId: response.data.transaction_id ?? undefined,
+      txHash,
+      providerRequestId: response.data.transaction_id,
+    };
+  }
+
+  private toPrivyTronRawData(
+    transaction: TronUnsignedTransaction,
+    expectedOwner: string,
+    tronWeb: any,
+  ): Record<string, unknown> {
+    const contract = transaction.raw_data.contract;
+    if (contract.length !== 1 || !contract[0]?.parameter?.value) {
+      throw new ServiceUnavailableException('Expected one Tron contract transaction');
+    }
+    const type = contract[0].type;
+    const value = contract[0].parameter.value;
+    const ownerAddress = String(value.owner_address ?? '');
+    if (ownerAddress.toLowerCase() !== String(tronWeb.address.toHex(expectedOwner)).toLowerCase()) {
+      throw new ServiceUnavailableException('Tron transaction owner does not match Privy wallet');
+    }
+    let privyContract: Record<string, unknown>;
+    let data: string | undefined;
+    if (type === 'TransferContract') {
+      privyContract = {
+        type,
+        owner_address: ownerAddress,
+        to_address: String(value.to_address ?? ''),
+        amount: Number(value.amount),
+      };
+    } else if (type === 'TriggerSmartContract') {
+      privyContract = {
+        type,
+        owner_address: ownerAddress,
+        contract_address: String(value.contract_address ?? ''),
+        ...(value.call_token_value !== undefined
+          ? { call_token_value: Number(value.call_token_value) }
+          : {}),
+        ...(value.token_id !== undefined ? { token_id: Number(value.token_id) } : {}),
+      };
+      data = String(value.data ?? '');
+      if (!/^[0-9a-f]+$/i.test(data)) {
+        throw new ServiceUnavailableException('Tron smart contract calldata is invalid');
+      }
+    } else {
+      throw new ServiceUnavailableException(`Unsupported Tron contract type: ${type}`);
+    }
+    const rawData = transaction.raw_data;
+    return {
+      contract: [privyContract],
+      ...(data ? { data } : {}),
+      ...(rawData.fee_limit !== undefined ? { fee_limit: rawData.fee_limit } : {}),
+      ...(rawData.expiration !== undefined ? { expiration: rawData.expiration } : {}),
+      ...(rawData.ref_block_bytes ? { ref_block_bytes: rawData.ref_block_bytes } : {}),
+      ...(rawData.ref_block_hash ? { ref_block_hash: rawData.ref_block_hash } : {}),
+      ...(rawData.timestamp !== undefined ? { timestamp: rawData.timestamp } : {}),
     };
   }
 
@@ -756,8 +850,13 @@ export class PrivyCustodyService {
     const fallback = mainnet
       ? this.config.get<string>('TRON_RPC_FALLBACK_URL', '')
       : this.config.get<string>('TRON_NILE_RPC_FALLBACK_URL', '');
-    const fullHost = (rpcUrl || fallback || '').trim().replace(/\/$/, '');
-    if (!fullHost) {
+    const publicFullNode = mainnet
+      ? this.config.get<string>('TRON_PUBLIC_FULLNODE_URL', 'https://tron-rpc.publicnode.com')
+      : '';
+    const fullHosts = [...new Set([rpcUrl, fallback, publicFullNode]
+      .map((value) => value.trim().replace(/\/$/, ''))
+      .filter(Boolean))];
+    if (fullHosts.length === 0) {
       throw new ServiceUnavailableException('TRON RPC is not configured');
     }
     const tronModule = await this.dynamicImport('tronweb') as {
@@ -772,43 +871,66 @@ export class PrivyCustodyService {
       mainnet ? 'TRON_PRO_API_KEY' : 'TRON_NILE_PRO_API_KEY',
       '',
     ).trim();
-    return new TronWebCtor({
-      fullHost,
-      ...(apiKey ? { headers: { 'TRON-PRO-API-KEY': apiKey } } : {}),
-    });
+    let lastStatus = 0;
+    for (const fullHost of fullHosts) {
+      const useApiKey = apiKey && fullHost === rpcUrl.trim().replace(/\/$/, '');
+      const headers = useApiKey ? { 'TRON-PRO-API-KEY': apiKey } : undefined;
+      try {
+        const probe = await fetch(`${fullHost}/wallet/getnowblock`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', ...(headers ?? {}) },
+          body: '{}',
+          signal: AbortSignal.timeout(8_000),
+        });
+        lastStatus = probe.status;
+        if (!probe.ok) continue;
+        return new TronWebCtor({ fullHost, ...(headers ? { headers } : {}) });
+      } catch (_error) {
+        continue;
+      }
+    }
+    throw new ServiceUnavailableException(
+      `No healthy TRON FullNode is available${lastStatus ? ` (last HTTP ${lastStatus})` : ''}`,
+    );
   }
 
-  private mapTronWebRawData(rawData: {
-    contract: Array<{
-      type: string;
-      parameter?: { value?: Record<string, unknown> };
-    }>;
-    fee_limit?: number;
-  }): Record<string, unknown> {
-    const contract = rawData.contract.map((item) => {
-      const value = item.parameter?.value ?? {};
-      if (item.type === 'TransferContract') {
-        return {
-          type: 'TransferContract',
-          owner_address: value.owner_address,
-          to_address: value.to_address,
-          amount: Number(value.amount ?? 0),
-        };
-      }
-      if (item.type === 'TriggerSmartContract') {
-        return {
-          type: 'TriggerSmartContract',
-          owner_address: value.owner_address,
-          contract_address: value.contract_address,
-          ...(value.data ? { data: value.data } : {}),
-          ...(value.call_value != null ? { call_value: Number(value.call_value) } : {}),
-        };
-      }
-      throw new ServiceUnavailableException(`Unsupported Tron contract type ${item.type}`);
-    });
-    return {
-      contract,
-      ...(rawData.fee_limit != null ? { fee_limit: rawData.fee_limit } : {}),
-    };
+  private assertTronTrc20Transfer(input: {
+    transaction: TronUnsignedTransaction;
+    fromAddress: string;
+    toAddress: string;
+    contractAddress: string;
+    rawAmount: bigint;
+    tronWeb: any;
+  }): void {
+    const contracts = input.transaction.raw_data?.contract ?? [];
+    if (contracts.length !== 1 || contracts[0]?.type !== 'TriggerSmartContract') {
+      throw new ServiceUnavailableException('Expected one Tron TriggerSmartContract transaction');
+    }
+    const value = contracts[0].parameter?.value ?? {};
+    if (Number(value.call_value ?? 0) !== 0) {
+      throw new ServiceUnavailableException('Tron TRC20 transfer must have zero call_value');
+    }
+    const ownerAddress = String(value.owner_address ?? '');
+    const contractAddress = String(value.contract_address ?? '');
+    const calldata = String(value.data ?? '').replace(/^0x/i, '').toLowerCase();
+    const expectedOwner = String(input.tronWeb.address.toHex(input.fromAddress)).replace(/^0x/i, '');
+    const expectedContract = String(input.tronWeb.address.toHex(input.contractAddress)).replace(/^0x/i, '');
+    const expectedRecipient = String(input.tronWeb.address.toHex(input.toAddress))
+      .replace(/^0x/i, '')
+      .slice(2)
+      .toLowerCase();
+    if (ownerAddress.toLowerCase() !== expectedOwner.toLowerCase() ||
+        contractAddress.toLowerCase() !== expectedContract.toLowerCase()) {
+      throw new ServiceUnavailableException('Tron TRC20 transaction owner or contract mismatch');
+    }
+    if (!/^a9059cbb[0-9a-f]{128}$/.test(calldata)) {
+      throw new ServiceUnavailableException('Tron TRC20 transfer calldata is missing or malformed');
+    }
+    const encodedRecipient = calldata.slice(8, 72).slice(-40);
+    const encodedAmount = BigInt(`0x${calldata.slice(72, 136)}`);
+    if (encodedRecipient !== expectedRecipient || encodedAmount !== input.rawAmount) {
+      throw new ServiceUnavailableException('Tron TRC20 transfer calldata does not match request');
+    }
   }
+
 }

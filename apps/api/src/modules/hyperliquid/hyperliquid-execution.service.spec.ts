@@ -26,6 +26,7 @@ describe('HyperliquidExecutionService readiness', () => {
       MARKET_DATA_PROVIDER: 'HYPERLIQUID',
       MARKET_DATA_FALLBACK_TO_MOCK: false,
       HYPERLIQUID_MIN_ACCOUNT_VALUE_USDC: '25',
+      HYPERLIQUID_MIN_WITHDRAWABLE_USDC: '5',
     };
     const config = {
       get: jest.fn((key: string, fallback?: unknown) => values[key] ?? fallback),
@@ -47,6 +48,7 @@ describe('HyperliquidExecutionService readiness', () => {
         extraAgents: jest.fn().mockResolvedValue(extraAgents),
         clearinghouseState: jest.fn().mockResolvedValue({
           marginSummary: { accountValue: '25' },
+          withdrawable: '5',
         }),
       },
     } as never);
@@ -59,6 +61,7 @@ describe('HyperliquidExecutionService readiness', () => {
       ready: true,
       reasons: [],
       accountValue: '25',
+      withdrawable: '5',
       agentRegistered: true,
     });
   });
@@ -69,6 +72,24 @@ describe('HyperliquidExecutionService readiness', () => {
       ready: false,
       reasons: ['AGENT_NOT_REGISTERED'],
       agentRegistered: false,
+    });
+  });
+
+  it('blocks new risk when account value exists but withdrawable collateral is zero', async () => {
+    const service = createService([{ address: agent, validUntil: null }]);
+    const clients = await (service as unknown as { createClients: () => Promise<{
+      info: { clearinghouseState: jest.Mock };
+    }> }).createClients();
+    clients.info.clearinghouseState.mockResolvedValue({
+      marginSummary: { accountValue: '34' },
+      withdrawable: '0',
+    });
+
+    await expect(service.getReadiness()).resolves.toMatchObject({
+      ready: false,
+      reasons: ['COLLATERAL_INSUFFICIENT'],
+      accountValue: '34',
+      withdrawable: '0',
     });
   });
 });

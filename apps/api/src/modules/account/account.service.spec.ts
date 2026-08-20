@@ -6,6 +6,12 @@ import {
   UserStatus,
 } from '@prisma/client';
 import { ConfigService } from '@nestjs/config';
+
+jest.mock('../hyperliquid/hyperliquid-order-format', () => ({
+  formatHyperliquidPrice: (price: string) => price,
+  formatHyperliquidSize: (size: string) => size,
+}));
+
 import { PrismaService } from '../../database/prisma.service';
 import { LedgerService } from '../ledger/ledger.service';
 import { RpcProvider } from '../rpc/rpc-provider.interface';

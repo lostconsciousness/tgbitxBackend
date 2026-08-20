@@ -113,6 +113,43 @@ describe('MarketDataService', () => {
     expect(hyperliquid.getMarketContexts).toHaveBeenCalledTimes(1);
   });
 
+  it('uses the live order-book midpoint instead of a stale internal trade', async () => {
+    const markets = {
+      getBySymbol: jest.fn().mockResolvedValue({ id: 'eth-market', symbol: 'ETH-PERP' }),
+    };
+    const prisma = {
+      trade: {
+        findMany: jest.fn().mockResolvedValue([{
+          price: '1940.2',
+          size: '1',
+          notional: '1940.2',
+        }]),
+      },
+    };
+    const tickerService = new MarketDataService(
+      provider,
+      {} as HyperliquidMarketDataProvider,
+      markets as unknown as MarketsService,
+      { get: jest.fn().mockReturnValue('HYPERLIQUID') } as unknown as ConfigService,
+      prisma as unknown as PrismaService,
+    );
+    jest.spyOn(tickerService, 'getOrderBook').mockResolvedValue({
+      symbol: 'ETH-PERP',
+      provider: 'HYPERLIQUID',
+      providerSymbol: 'ETH',
+      time: 1,
+      bids: [{ price: '1887.1', size: '1', orders: 1 }],
+      asks: [{ price: '1887.2', size: '1', orders: 1 }],
+    });
+
+    await expect(tickerService.getTicker('ETH-PERP')).resolves.toEqual(
+      expect.objectContaining({
+        markPrice: '1887.15',
+        lastPrice: '1887.15',
+      }),
+    );
+  });
+
   it('uses Hyperliquid candles for a configured perpetual market', async () => {
     const hyperliquid = {
       getCandles: jest.fn().mockResolvedValue([{

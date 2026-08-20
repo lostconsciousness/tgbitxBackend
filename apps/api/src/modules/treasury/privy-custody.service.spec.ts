@@ -394,10 +394,13 @@ describe('PrivyCustodyService', () => {
     );
   });
 
-  it('broadcasts Tron transactions through Privy tron_sendTransaction RPC', async () => {
+  it('sends a validated structured Tron transaction through Privy', async () => {
     const rpc = jest.fn().mockResolvedValue({
       method: 'tron_sendTransaction',
-      data: { hash: 'tron-txid', transaction_id: 'privy-tron-tx-1' },
+      data: {
+        hash: 'a'.repeat(64),
+        transaction_id: 'privy-tron-1',
+      },
     });
     const service = new PrivyCustodyService({
       get: jest.fn((key: string, fallback?: unknown) => {
@@ -426,13 +429,22 @@ describe('PrivyCustodyService', () => {
     (service as any).dynamicImport = jest.fn().mockResolvedValue({
       PrivyClient: class {
         wallets() {
-          return { rpc };
+          return {
+            get: jest.fn().mockResolvedValue({ address: 'TFrom' }),
+            rpc,
+          };
         }
       },
     });
     (service as any).createTronWebClient = jest.fn().mockResolvedValue({
+      trx: {
+        ecRecover: jest.fn().mockReturnValue('TFrom'),
+      },
+      address: { toHex: jest.fn().mockReturnValue('41owner') },
       transactionBuilder: {
         sendTrx: jest.fn().mockResolvedValue({
+          txID: 'a'.repeat(64),
+          raw_data_hex: 'aabb',
           raw_data: {
             contract: [{
               type: 'TransferContract',
@@ -462,12 +474,138 @@ describe('PrivyCustodyService', () => {
       'tron-wallet-id',
       expect.objectContaining({
         method: 'tron_sendTransaction',
-        caip2: 'tron:mainnet',
+        params: {
+          raw_data: {
+            contract: [{
+              type: 'TransferContract',
+              owner_address: '41owner',
+              to_address: '41to',
+              amount: 1000,
+            }],
+          },
+          reference_id: 'withdrawal:tron-1',
+        },
       }),
     );
     expect(result).toEqual({
-      txHash: 'tron-txid',
-      providerRequestId: 'privy-tron-tx-1',
+      txHash: 'a'.repeat(64),
+      providerRequestId: 'privy-tron-1',
     });
+  });
+
+  it('validates the exact Tron TRC20 transfer calldata before signing', () => {
+    const service = new PrivyCustodyService({} as ConfigService);
+    const recipientHex = '22'.repeat(20);
+    const calldata = `a9059cbb${recipientHex.padStart(64, '0')}${'64'.padStart(64, '0')}`;
+    expect(() => (service as any).assertTronTrc20Transfer({
+      transaction: {
+        raw_data_hex: 'aabb',
+        raw_data: {
+          contract: [{
+            type: 'TriggerSmartContract',
+            parameter: { value: {
+              owner_address: `41${'11'.repeat(20)}`,
+              contract_address: `41${'33'.repeat(20)}`,
+              data: calldata,
+            } },
+          }],
+        },
+      },
+      fromAddress: 'TFrom',
+      toAddress: 'TTo',
+      contractAddress: 'TContract',
+      rawAmount: 100n,
+      tronWeb: { address: { toHex: jest.fn((address: string) => ({
+        TFrom: `41${'11'.repeat(20)}`,
+        TTo: `41${recipientHex}`,
+        TContract: `41${'33'.repeat(20)}`,
+      })[address]) } },
+    })).not.toThrow();
+  });
+
+  it('maps TronWeb TRC20 data to the structured Privy RPC schema', () => {
+    const service = new PrivyCustodyService({} as ConfigService);
+    expect((service as any).toPrivyTronRawData({
+      raw_data_hex: 'aabb',
+      raw_data: {
+        contract: [{
+          type: 'TriggerSmartContract',
+          parameter: { value: {
+            owner_address: `41${'11'.repeat(20)}`,
+            contract_address: `41${'33'.repeat(20)}`,
+            data: 'a9059cbb' + '00'.repeat(64),
+          } },
+        }],
+        fee_limit: 35_000_000,
+      },
+    }, 'TFrom', {
+      address: { toHex: jest.fn().mockReturnValue(`41${'11'.repeat(20)}`) },
+    })).toEqual({
+      contract: [{
+        type: 'TriggerSmartContract',
+        owner_address: `41${'11'.repeat(20)}`,
+        contract_address: `41${'33'.repeat(20)}`,
+      }],
+      data: 'a9059cbb' + '00'.repeat(64),
+      fee_limit: 35_000_000,
+    });
+  });
+
+  it('rejects missing Tron TRC20 calldata before signing', () => {
+    const service = new PrivyCustodyService({} as ConfigService);
+    expect(() => (service as any).assertTronTrc20Transfer({
+      transaction: {
+        raw_data_hex: 'aabb',
+        raw_data: {
+          contract: [{
+            type: 'TriggerSmartContract',
+            parameter: { value: {
+              owner_address: `41${'11'.repeat(20)}`,
+              contract_address: `41${'33'.repeat(20)}`,
+              data: '',
+            } },
+          }],
+        },
+      },
+      fromAddress: 'TFrom',
+      toAddress: 'TTo',
+      contractAddress: 'TContract',
+      rawAmount: 100n,
+      tronWeb: { address: { toHex: jest.fn((address: string) => ({
+        TFrom: `41${'11'.repeat(20)}`,
+        TTo: `41${'22'.repeat(20)}`,
+        TContract: `41${'33'.repeat(20)}`,
+      })[address]) } },
+    })).toThrow('calldata is missing or malformed');
+  });
+
+  it('rejects a malformed Tron smart-contract call instead of signing it', () => {
+    const service = new PrivyCustodyService({} as ConfigService);
+    expect(() => (service as any).assertTronTrc20Transfer({
+      transaction: { raw_data_hex: 'aabb', raw_data: { contract: [] } },
+      fromAddress: 'TFrom',
+      toAddress: 'TTo',
+      contractAddress: 'TContract',
+      rawAmount: 1n,
+      tronWeb: { address: { toHex: jest.fn() } },
+    })).toThrow('Expected one Tron TriggerSmartContract transaction');
+  });
+
+  it('rejects non-zero Tron call_value before Privy submission', () => {
+    const service = new PrivyCustodyService({} as ConfigService);
+    expect(() => (service as any).assertTronTrc20Transfer({
+      transaction: {
+        raw_data_hex: 'aabb',
+        raw_data: { contract: [{
+          type: 'TriggerSmartContract',
+          parameter: { value: { call_value: 1 } },
+        }] },
+      },
+      fromAddress: 'TFrom',
+      toAddress: 'TTo',
+      contractAddress: 'TContract',
+      rawAmount: 1n,
+      tronWeb: { address: { toHex: jest.fn() } },
+    })).toThrow();
   });
 });
