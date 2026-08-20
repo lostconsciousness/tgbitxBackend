@@ -16,6 +16,7 @@ export class MarketsService {
 
   async list() {
     const markets = await this.prisma.market.findMany({
+      where: { status: 'ACTIVE' },
       include: { baseAsset: true, quoteAsset: true, riskConfig: true, feeConfig: true },
       orderBy: { symbol: 'asc' },
     });

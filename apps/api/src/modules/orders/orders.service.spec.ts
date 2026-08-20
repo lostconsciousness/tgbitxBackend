@@ -86,6 +86,45 @@ describe('OrdersService settlement ledger', () => {
       ),
     ).toBe(false);
   });
+
+  it('absorbs negative liquidation equity without crediting uncollectible fees', async () => {
+    const postTransaction = jest.fn().mockResolvedValue({ id: 'ledger-negative-equity' });
+    const service = new OrdersService(
+      {} as PrismaService,
+      {} as ConfigService,
+      {} as MarketsService,
+      {} as MarketDataService,
+      {} as RoutingService,
+      { postTransaction } as unknown as LedgerService,
+      {} as HyperliquidExecutionService,
+      {} as OperationalSettingsService,
+    );
+
+    await service.settlePositionLedger({} as Prisma.TransactionClient, {
+      idempotencyKey: 'liquidation:negative-equity',
+      userId: 'user-1',
+      assetId: 'usdc',
+      route: ExecutionRoute.A_BOOK_HYPERLIQUID,
+      margin: new Prisma.Decimal('9.9487665'),
+      pnl: new Prisma.Decimal('-10.1559'),
+      fee: new Prisma.Decimal('0.0546868575'),
+      platformFee: new Prisma.Decimal('0.2142947955'),
+      insuranceFee: new Prisma.Decimal('0.068403402'),
+      transactionType: LedgerTransactionType.LIQUIDATION,
+    });
+
+    const posting = postTransaction.mock.calls[0][0];
+    assertBalancedLedgerEntries(posting.entries);
+    expect(posting.entries).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ accountType: LedgerAccountType.PLATFORM_FEES }),
+    ]));
+    expect(posting.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        accountType: LedgerAccountType.INSURANCE,
+        direction: LedgerEntryDirection.DEBIT,
+      }),
+    ]));
+  });
 });
 
 describe('OrdersService execution readiness', () => {
@@ -339,6 +378,90 @@ describe('OrdersService provider recovery', () => {
       }),
     });
     expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('terminalizes a fully accounted fill even while the provider snapshot is still unknown', async () => {
+    const originalOrder = {
+      id: 'order-filled-before-snapshot',
+      userId: 'user-1',
+      marketId: market.id,
+      status: OrderStatus.PROVIDER_PENDING,
+      size: new Prisma.Decimal('0.001'),
+      filledSize: new Prisma.Decimal(0),
+      marginReserved: new Prisma.Decimal('10'),
+      market,
+      liquidationEvent: null,
+    };
+    const filledOrder = {
+      ...originalOrder,
+      status: OrderStatus.FILLED,
+      filledSize: new Prisma.Decimal('0.001'),
+    };
+    const providerOrder = {
+      id: 'provider-filled-before-snapshot',
+      orderId: originalOrder.id,
+      providerOrderId: null,
+      cloid: `0x${'d'.repeat(32)}`,
+      status: ProviderOrderStatus.PENDING,
+      syncAttempts: 0,
+      createdAt: new Date(),
+      order: originalOrder,
+    };
+    const tx = {
+      providerOrder: { update: jest.fn().mockResolvedValue({}) },
+      order: { update: jest.fn().mockResolvedValue({}) },
+    };
+    const prisma = {
+      providerOrder: { findUnique: jest.fn().mockResolvedValue(providerOrder) },
+      order: { findUniqueOrThrow: jest.fn().mockResolvedValue(filledOrder) },
+      $transaction: jest.fn(async (callback: (client: typeof tx) => unknown) => callback(tx)),
+    };
+    const hyperliquid = {
+      getOrderSnapshot: jest.fn().mockResolvedValue({ status: 'UNKNOWN', raw: {} }),
+      getOrderFills: jest.fn().mockResolvedValue([{
+        providerFillId: 'fill-1',
+        providerOrderId: 'provider-oid',
+        price: '65000',
+        size: '0.001',
+        feeAmount: '0.01',
+        occurredAt: new Date(),
+        raw: {},
+      }]),
+    };
+    const updates = { publish: jest.fn() };
+    const service = new OrdersService(
+      prisma as unknown as PrismaService,
+      { get: jest.fn((_key: string, fallback?: unknown) => fallback) } as unknown as ConfigService,
+      {} as MarketsService,
+      {} as MarketDataService,
+      {} as RoutingService,
+      {} as LedgerService,
+      hyperliquid as unknown as HyperliquidExecutionService,
+      {} as OperationalSettingsService,
+      updates as never,
+    );
+    jest.spyOn(service as never, 'applyProviderFill' as never).mockResolvedValue(undefined as never);
+
+    await service.reconcileProviderOrder(originalOrder.id);
+
+    expect(tx.providerOrder.update).toHaveBeenCalledWith({
+      where: { id: providerOrder.id },
+      data: expect.objectContaining({
+        status: ProviderOrderStatus.FILLED,
+        nextSyncAt: null,
+        reconciliationRequiredAt: null,
+      }),
+    });
+    expect(tx.order.update).toHaveBeenCalledWith({
+      where: { id: originalOrder.id },
+      data: { status: OrderStatus.FILLED },
+    });
+    expect(updates.publish).toHaveBeenCalledWith('user-1', [
+      'balances',
+      'orders',
+      'positions',
+      'trades',
+    ]);
   });
 
   it('cancels an A-book order by cloid and delegates release to reconciliation', async () => {

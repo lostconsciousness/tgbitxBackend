@@ -19,6 +19,7 @@ export type HyperliquidPerpSyncResult = {
   marketsUpserted: number;
   assetsCreated: number;
   skippedDelisted: number;
+  marketsDeactivated: number;
 };
 
 function configuredLegacyChain(): Chain {
@@ -78,10 +79,24 @@ export async function syncHyperliquidPerpMarkets(
   let marketsUpserted = 0;
   let assetsCreated = 0;
   let skippedDelisted = 0;
+  let marketsDeactivated = 0;
 
   for (const hlAsset of meta.universe) {
     if (hlAsset.isDelisted) {
       skippedDelisted += 1;
+      const deactivated = await prisma.market.updateMany({
+        where: {
+          type: MarketType.PERP,
+          providerName: 'HYPERLIQUID',
+          providerSymbol: hlAsset.name,
+          status: MarketStatus.ACTIVE,
+        },
+        data: {
+          status: MarketStatus.DISABLED,
+          orderbookEnabled: false,
+        },
+      });
+      marketsDeactivated += deactivated.count;
       continue;
     }
 
@@ -171,5 +186,6 @@ export async function syncHyperliquidPerpMarkets(
     marketsUpserted,
     assetsCreated,
     skippedDelisted,
+    marketsDeactivated,
   };
 }

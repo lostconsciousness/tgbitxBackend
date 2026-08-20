@@ -1786,7 +1786,27 @@ export class OrdersService {
       const fullyFilled = new Prisma.Decimal(order.filledSize).greaterThanOrEqualTo(order.size);
       const now = new Date();
 
-      if (snapshot.status === 'UNKNOWN') {
+      // Provider fills are authoritative. Hyperliquid can expose a fill before
+      // the order-by-cloid snapshot catches up; do not leave a fully filled
+      // internal order in PROVIDER_PENDING until a later polling cycle.
+      if (fullyFilled) {
+        await this.prisma.$transaction(async (tx) => {
+          await tx.providerOrder.update({
+            where: { id: providerOrder.id },
+            data: {
+              providerOrderId: snapshot.providerOrderId ?? providerOrder.providerOrderId,
+              status: ProviderOrderStatus.FILLED,
+              rawResponse: this.toJson(snapshot.raw),
+              lastSyncedAt: now,
+              nextSyncAt: null,
+              syncAttempts: 0,
+              failureReason: null,
+              reconciliationRequiredAt: null,
+            },
+          });
+          await tx.order.update({ where: { id: orderId }, data: { status: OrderStatus.FILLED } });
+        });
+      } else if (snapshot.status === 'UNKNOWN') {
         await this.scheduleProviderRetry(providerOrder, 'Hyperliquid order is not visible by cloid');
       } else if (snapshot.status === 'OPEN') {
         await this.prisma.$transaction(async (tx) => {
@@ -1813,22 +1833,6 @@ export class OrdersService {
             },
           });
         });
-      } else if (snapshot.status === 'FILLED' && fullyFilled) {
-        await this.prisma.$transaction(async (tx) => {
-          await tx.providerOrder.update({
-            where: { id: providerOrder.id },
-            data: {
-              providerOrderId: snapshot.providerOrderId,
-              status: ProviderOrderStatus.FILLED,
-              rawResponse: this.toJson(snapshot.raw),
-              lastSyncedAt: now,
-              nextSyncAt: null,
-              syncAttempts: 0,
-              failureReason: null,
-            },
-          });
-          await tx.order.update({ where: { id: orderId }, data: { status: OrderStatus.FILLED } });
-        });
       } else if (snapshot.status === 'FILLED') {
         await this.releaseUnfilledProviderMargin(providerOrder.order);
         await this.prisma.$transaction(async (tx) => {
@@ -1853,7 +1857,6 @@ export class OrdersService {
             },
           });
         });
-        this.publishTradingUpdate(providerOrder.order.userId);
       } else {
         await this.releaseUnfilledProviderMargin(providerOrder.order);
         await this.prisma.$transaction(async (tx) => {
@@ -1879,6 +1882,10 @@ export class OrdersService {
           });
         });
       }
+      // applyProviderFill commits separately and publishes an immediate balance
+      // update. Publish once more after the provider/order terminal state is
+      // committed so clients never remain on a stale PROVIDER_PENDING label.
+      this.publishTradingUpdate(providerOrder.order.userId);
       return this.prisma.order.findUniqueOrThrow({
         where: { id: orderId },
         include: { market: true, providerOrder: true, trades: true },
@@ -1895,6 +1902,7 @@ export class OrdersService {
         providerOrder,
         reason,
       );
+      this.publishTradingUpdate(providerOrder.order.userId);
       throw error;
     }
   }
@@ -2479,7 +2487,9 @@ export class OrdersService {
               margin: 0,
               realizedPnl: { increment: realizedPnl },
               unrealizedPnl: 0,
-              status: PositionStatus.CLOSED,
+              status: input.settlement
+                ? PositionStatus.LIQUIDATED
+                : PositionStatus.CLOSED,
               closedAt: new Date(),
               markPrice: input.price,
             }
@@ -2542,8 +2552,19 @@ export class OrdersService {
         ? LedgerAccountType.PLATFORM_BBOOK
         : LedgerAccountType.PROVIDER_CLEARING;
     const settlement = input.margin.plus(input.pnl);
-    const platformFee = input.platformFee ?? input.fee;
-    const insuranceFee = input.insuranceFee ?? new Prisma.Decimal(0);
+    const requestedPlatformFee = input.platformFee ?? input.fee;
+    const requestedInsuranceFee = input.insuranceFee ?? new Prisma.Decimal(0);
+    // A liquidation quote is calculated from the trigger mark, while the
+    // provider fill can be worse. Fees may therefore exceed the equity that is
+    // actually left at execution. Only collect fees from non-negative equity;
+    // otherwise the posting becomes unbalanced and the provider fill can never
+    // be reconciled.
+    const availableForFees = Prisma.Decimal.max(0, settlement);
+    const platformFee = Prisma.Decimal.min(requestedPlatformFee, availableForFees);
+    const insuranceFee = Prisma.Decimal.min(
+      requestedInsuranceFee,
+      Prisma.Decimal.max(0, availableForFees.minus(platformFee)),
+    );
     const payout = Prisma.Decimal.max(0, settlement.minus(platformFee).minus(insuranceFee));
     const deficit = Prisma.Decimal.max(0, settlement.negated());
     const entries: LedgerPostingEntry[] = [
