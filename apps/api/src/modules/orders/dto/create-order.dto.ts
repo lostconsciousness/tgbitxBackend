@@ -59,4 +59,12 @@ export class CreateOrderDto {
   @IsOptional()
   @IsBoolean()
   reduceOnly?: boolean;
+
+  @ApiPropertyOptional({
+    default: false,
+    description: 'Size the opening PERP order from the current server-side available balance, including fees',
+  })
+  @IsOptional()
+  @IsBoolean()
+  useAvailableBalance?: boolean;
 }

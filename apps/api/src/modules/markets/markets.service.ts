@@ -42,6 +42,8 @@ export class MarketsService {
       ...market,
       maxLeverage: Math.min(market.riskConfig?.maxLeverage ?? 1, pilotMaxLeverage),
       takerFeeBps: market.feeConfig?.takerFeeBps ?? 5,
+      minOrderNotionalUsdc: this.config.get<string>('PERP_MIN_ORDER_NOTIONAL_USDC', '0'),
+      maxOrderNotionalUsdc: this.config.get<string>('PERP_MAX_ORDER_NOTIONAL_USDC', '100'),
     };
   }
 

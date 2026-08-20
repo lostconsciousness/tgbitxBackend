@@ -32,6 +32,33 @@ import { CreateOrderDto } from './dto/create-order.dto';
 import { OperationalSettingsService } from '../settings/operational-settings.service';
 import { UserUpdatesService } from '../user-updates/user-updates.service';
 
+export function calculateMaxAffordablePerpSize(input: {
+  availableBalance: Prisma.Decimal;
+  marginPrice: Prisma.Decimal;
+  feePrice: Prisma.Decimal;
+  leverage: number;
+  takerFeeBps: number;
+  sizePrecision: number;
+  maxNotional: Prisma.Decimal;
+}): Prisma.Decimal {
+  if (
+    input.availableBalance.lessThanOrEqualTo(0) ||
+    input.marginPrice.lessThanOrEqualTo(0) ||
+    input.feePrice.lessThanOrEqualTo(0) ||
+    input.leverage <= 0
+  ) {
+    return new Prisma.Decimal(0);
+  }
+  const costPerUnit = input.marginPrice.div(input.leverage).plus(
+    input.feePrice.mul(input.takerFeeBps).div(10_000),
+  );
+  const affordableSize = input.availableBalance.div(costPerUnit);
+  const cappedSize = input.maxNotional.greaterThan(0)
+    ? Prisma.Decimal.min(affordableSize, input.maxNotional.div(input.marginPrice))
+    : affordableSize;
+  return cappedSize.toDecimalPlaces(input.sizePrecision, Prisma.Decimal.ROUND_FLOOR);
+}
+
 @Injectable()
 export class OrdersService {
   private providerExecutionQueue: Promise<void> = Promise.resolve();
@@ -164,8 +191,8 @@ export class OrdersService {
     }
     await this.assertUniqueClientOrderId(userId, dto.clientOrderId);
     const market = await this.markets.getBySymbol(dto.symbol);
-    const size = new Prisma.Decimal(dto.size);
-    if (size.lessThan(market.minOrderSize)) {
+    let size = new Prisma.Decimal(dto.size);
+    if (!dto.useAvailableBalance && size.lessThan(market.minOrderSize)) {
       throw new BadRequestException('Order size is below market minimum');
     }
     if (
@@ -178,12 +205,21 @@ export class OrdersService {
       throw new BadRequestException('Market is not active');
     }
     if (market.type === MarketType.SPOT) {
+      if (dto.useAvailableBalance) {
+        throw new BadRequestException('Server-side MAX sizing is only available for PERP orders');
+      }
       const spotOrder = await this.createSpotOrder(userId, dto, market, size);
       this.publishTradingUpdate(userId);
       return spotOrder;
     }
     if (market.type !== MarketType.PERP || market.status !== MarketStatus.ACTIVE) {
       throw new BadRequestException('Perpetual market is not active');
+    }
+    if (
+      dto.useAvailableBalance &&
+      (dto.reduceOnly || dto.type === OrderType.STOP_LOSS || dto.type === OrderType.TAKE_PROFIT)
+    ) {
+      throw new BadRequestException('Server-side MAX sizing is only available for opening PERP orders');
     }
     if (
       (dto.type === OrderType.STOP_LOSS || dto.type === OrderType.TAKE_PROFIT) &&
@@ -245,20 +281,25 @@ export class OrdersService {
     if (dto.reduceOnly && !existingPosition) {
       throw new BadRequestException('Reduce-only order requires an open position');
     }
-    const notional = size.mul(mark);
     const minNotional = new Prisma.Decimal(
       this.config.get<string>('PERP_MIN_ORDER_NOTIONAL_USDC', '0'),
     );
     const maxNotional = new Prisma.Decimal(
       this.config.get<string>('PERP_MAX_ORDER_NOTIONAL_USDC', '100'),
     );
-    if (!dto.reduceOnly && minNotional.greaterThan(0) && notional.lessThan(minNotional)) {
+    const routingNotional = size.mul(mark);
+    if (
+      !dto.useAvailableBalance &&
+      !dto.reduceOnly &&
+      minNotional.greaterThan(0) &&
+      routingNotional.lessThan(minNotional)
+    ) {
       throw new BadRequestException({
         code: 'PERP_NOTIONAL_TOO_LOW',
         message: `Minimum perpetual order notional is ${minNotional.toString()} USDC`,
       });
     }
-    if (!dto.reduceOnly && notional.greaterThan(maxNotional)) {
+    if (!dto.useAvailableBalance && !dto.reduceOnly && routingNotional.greaterThan(maxNotional)) {
       throw new BadRequestException({
         code: 'PERP_NOTIONAL_TOO_HIGH',
         message: `Maximum perpetual order notional is ${maxNotional.toString()} USDC`,
@@ -269,7 +310,7 @@ export class OrdersService {
       existingPosition?.route ??
       (await this.routing.decide({
         marketId: market.id,
-        notional,
+        notional: routingNotional,
         platformMarkAgeMs: markAgeMs,
         side: dto.side,
         book,
@@ -308,13 +349,53 @@ export class OrdersService {
         });
       }
     }
-    const executionPrice = route === ExecutionRoute.B_BOOK_INTERNAL
+    const feeConfig = await this.getFeeConfig(market.id);
+    let executionPrice = route === ExecutionRoute.B_BOOK_INTERNAL
       ? this.calculateBookVwap(book, dto.side, size)
       : mark;
+    if (dto.useAvailableBalance) {
+      const availableBalance = this.isMainnetBalanceMode()
+        ? await this.ledger.getUserMainnetSpotBalance({
+            userId,
+            assetId: market.quoteAssetId,
+          })
+        : await this.ledger.getUserSpotBalance({
+            userId,
+            assetId: market.quoteAssetId,
+          });
+      size = calculateMaxAffordablePerpSize({
+        availableBalance,
+        marginPrice: mark,
+        feePrice: executionPrice,
+        leverage,
+        takerFeeBps: feeConfig.takerFeeBps,
+        sizePrecision: market.sizePrecision,
+        maxNotional,
+      });
+      if (route === ExecutionRoute.B_BOOK_INTERNAL && size.greaterThan(0)) {
+        executionPrice = this.calculateBookVwap(book, dto.side, size);
+      }
+    }
+    if (size.lessThan(market.minOrderSize)) {
+      throw new BadRequestException('Order size is below market minimum');
+    }
+    const notional = size.mul(mark);
+    if (!dto.reduceOnly && minNotional.greaterThan(0) && notional.lessThan(minNotional)) {
+      throw new BadRequestException({
+        code: 'PERP_NOTIONAL_TOO_LOW',
+        message: `Minimum perpetual order notional is ${minNotional.toString()} USDC`,
+      });
+    }
+    if (!dto.reduceOnly && notional.greaterThan(maxNotional)) {
+      throw new BadRequestException({
+        code: 'PERP_NOTIONAL_TOO_HIGH',
+        message: `Maximum perpetual order notional is ${maxNotional.toString()} USDC`,
+      });
+    }
     const executionNotional = size.mul(executionPrice);
     const margin = dto.reduceOnly ? new Prisma.Decimal(0) : notional.div(leverage);
     const fee = executionNotional
-      .mul((await this.getFeeConfig(market.id)).takerFeeBps)
+      .mul(feeConfig.takerFeeBps)
       .div(10_000);
 
     const order = await this.prisma.$transaction(async (tx) => {

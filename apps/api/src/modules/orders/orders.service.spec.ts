@@ -28,7 +28,39 @@ import { MarketsService } from '../markets/markets.service';
 import { RoutingService } from '../routing/routing.service';
 import { OperationalSettingsService } from '../settings/operational-settings.service';
 import { assertBalancedLedgerEntries } from '../ledger/ledger.validator';
-import { OrdersService } from './orders.service';
+import { calculateMaxAffordablePerpSize, OrdersService } from './orders.service';
+
+describe('calculateMaxAffordablePerpSize', () => {
+  it('includes both initial margin and taker fee and rounds down', () => {
+    const size = calculateMaxAffordablePerpSize({
+      availableBalance: new Prisma.Decimal(10),
+      marginPrice: new Prisma.Decimal(100),
+      feePrice: new Prisma.Decimal(100),
+      leverage: 10,
+      takerFeeBps: 5,
+      sizePrecision: 3,
+      maxNotional: new Prisma.Decimal(1000),
+    });
+
+    expect(size.toString()).toBe('0.995');
+    const required = size.mul(100).div(10).plus(size.mul(100).mul(5).div(10_000));
+    expect(required.lessThanOrEqualTo(10)).toBe(true);
+  });
+
+  it('also respects the configured maximum order notional', () => {
+    const size = calculateMaxAffordablePerpSize({
+      availableBalance: new Prisma.Decimal(100),
+      marginPrice: new Prisma.Decimal(100),
+      feePrice: new Prisma.Decimal(100),
+      leverage: 10,
+      takerFeeBps: 5,
+      sizePrecision: 4,
+      maxNotional: new Prisma.Decimal(5),
+    });
+
+    expect(size.toString()).toBe('0.05');
+  });
+});
 
 describe('OrdersService settlement ledger', () => {
   it('deducts close and liquidation fees before payout without unbalancing entries', async () => {
