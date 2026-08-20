@@ -42,7 +42,7 @@ async function bootstrap(): Promise<void> {
 
   app.use(helmet());
   const expressApp = app.getHttpAdapter().getInstance();
-  expressApp.set('etag', false);
+  expressApp.set('etag', 'strong');
   app.use((_req: Request, res: Response, next: NextFunction) => {
     res.setHeader('Cache-Control', 'no-store');
     next();

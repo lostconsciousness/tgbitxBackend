@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Header, Param, Post, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -23,6 +23,13 @@ export class OrdersController {
   @ApiOperation({ summary: 'List current user orders' })
   list(@CurrentUser() user: AuthenticatedUser) {
     return this.orders.listUserOrders(user.id);
+  }
+
+  @Get('open')
+  @Header('Cache-Control', 'no-store')
+  @ApiOperation({ summary: 'List only current user open/pending orders' })
+  open(@CurrentUser() user: AuthenticatedUser) {
+    return this.orders.listUserOpenOrders(user.id);
   }
 
   @Get('readiness')

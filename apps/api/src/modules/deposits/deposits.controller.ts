@@ -41,6 +41,15 @@ export class DepositsController {
     return this.depositAddressService.provision(user.id, dto.assetSymbol, dto.network);
   }
 
+  @Get('deposits/addresses')
+  @Header('Cache-Control', 'private, max-age=60, stale-while-revalidate=300')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({ summary: 'List current user personal deposit addresses by network' })
+  listDepositAddresses(@CurrentUser() user: AuthenticatedUser) {
+    return this.depositAddressService.listUser(user.id);
+  }
+
   @Get('deposits/options')
   @Header('Cache-Control', 'no-store')
   @ApiBearerAuth()
@@ -98,6 +107,15 @@ export class DepositsController {
       walletId: dto.walletId,
       network: dto.network,
     });
+  }
+
+  @Get('deposits/intents')
+  @Header('Cache-Control', 'no-store')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({ summary: 'List active deposit intents for the current user' })
+  listIntents(@CurrentUser() user: AuthenticatedUser) {
+    return this.depositsService.listActiveIntents(user.id);
   }
 
   @Post('deposits/intents/:id/submit')

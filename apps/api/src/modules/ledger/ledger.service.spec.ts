@@ -3,6 +3,55 @@ import { PrismaService } from '../../database/prisma.service';
 import { LedgerService } from './ledger.service';
 
 describe('LedgerService mainnet spot balance', () => {
+  it('loads all compact spot balances with one entries query and no network metadata', async () => {
+    const prisma = {
+      ledgerAccount: {
+        findMany: jest.fn().mockResolvedValue([
+          {
+            id: 'account-usdc',
+            assetId: 'asset-usdc',
+            asset: {
+              id: 'asset-usdc',
+              symbol: 'USDC',
+              name: 'USD Coin',
+              iconUrl: null,
+              type: 'STABLECOIN',
+              decimals: 6,
+            },
+          },
+        ]),
+      },
+      ledgerEntry: {
+        findMany: jest.fn().mockResolvedValue([
+          {
+            accountId: 'account-usdc',
+            assetId: 'asset-usdc',
+            direction: 'CREDIT',
+            amount: new Prisma.Decimal('12.5'),
+          },
+          {
+            accountId: 'account-usdc',
+            assetId: 'asset-usdc',
+            direction: 'DEBIT',
+            amount: new Prisma.Decimal('2'),
+          },
+        ]),
+      },
+    };
+    const service = new LedgerService(prisma as unknown as PrismaService);
+
+    await expect(service.listUserSpotBalances('user-1')).resolves.toEqual([{
+      asset: expect.objectContaining({ symbol: 'USDC' }),
+      balance: '10.5',
+      available: '10.5',
+      total: '10.5',
+    }]);
+    expect(prisma.ledgerEntry.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.ledgerAccount.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      select: expect.objectContaining({ asset: expect.any(Object) }),
+    }));
+  });
+
   it('excludes legacy testnet internal-transfer credits from mainnet balance', async () => {
     const prisma = {
       ledgerAccount: {

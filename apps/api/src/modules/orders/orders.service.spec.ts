@@ -79,6 +79,50 @@ describe('calculateMaxAffordablePerpSize', () => {
   });
 });
 
+describe('OrdersService open orders', () => {
+  it('queries only actionable statuses and returns compact decimal strings', async () => {
+    const findMany = jest.fn().mockResolvedValue([{
+      id: 'order-1',
+      clientOrderId: 'client-1',
+      side: OrderSide.BUY,
+      type: OrderType.LIMIT,
+      status: OrderStatus.OPEN,
+      route: ExecutionRoute.A_BOOK_HYPERLIQUID,
+      size: new Prisma.Decimal('1.25'),
+      filledSize: new Prisma.Decimal('0.25'),
+      price: new Prisma.Decimal('100'),
+      averageFillPrice: null,
+      triggerPrice: null,
+      leverage: 2,
+      reduceOnly: false,
+      createdAt: new Date('2026-08-20T00:00:00Z'),
+      updatedAt: new Date('2026-08-20T00:00:01Z'),
+      market: { id: 'market-1', symbol: 'TEST-PERP', type: MarketType.PERP },
+    }]);
+    const service = new OrdersService(
+      { order: { findMany } } as unknown as PrismaService,
+      {} as ConfigService,
+      {} as MarketsService,
+      {} as MarketDataService,
+      {} as RoutingService,
+      {} as LedgerService,
+      {} as HyperliquidExecutionService,
+      {} as OperationalSettingsService,
+    );
+
+    await expect(service.listUserOpenOrders('user-1')).resolves.toEqual([
+      expect.objectContaining({ size: '1.25', filledSize: '0.25', price: '100' }),
+    ]);
+    expect(findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        userId: 'user-1',
+        status: { in: expect.arrayContaining([OrderStatus.OPEN, OrderStatus.PROVIDER_PENDING]) },
+      }),
+      select: expect.any(Object),
+    }));
+  });
+});
+
 describe('OrdersService settlement ledger', () => {
   it('deducts close and liquidation fees before payout without unbalancing entries', async () => {
     const postTransaction = jest.fn().mockResolvedValue({ id: 'ledger-1' });

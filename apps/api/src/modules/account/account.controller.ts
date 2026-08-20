@@ -19,7 +19,10 @@ export class AccountController {
 
   @Get('overview')
   @Header('Cache-Control', 'no-store')
-  @ApiOperation({ summary: 'Get current user profile and currency balances for cabinet UI' })
+  @ApiOperation({
+    summary: 'Deprecated compatibility overview; new clients should use split resource endpoints',
+    deprecated: true,
+  })
   async overview(@CurrentUser() user: AuthenticatedUser) {
     const depositIndexer = this.moduleRef.get(DepositIndexerService, { strict: false });
     if (depositIndexer) {

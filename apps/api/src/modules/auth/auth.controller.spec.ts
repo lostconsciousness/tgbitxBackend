@@ -1,5 +1,6 @@
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
+import { ConfigService } from '@nestjs/config';
 import { UserRole, UserStatus } from '@prisma/client';
 import request = require('supertest');
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -41,6 +42,16 @@ describe('AuthController', () => {
         {
           provide: AuthService,
           useValue: authService,
+        },
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn((key: string, fallback: unknown) => {
+              if (key === 'MAINNET_ENABLED') return true;
+              if (key === 'HYPERLIQUID_TESTNET') return false;
+              return fallback;
+            }),
+          },
         },
       ],
     })
@@ -122,6 +133,11 @@ describe('AuthController', () => {
       email: 'trader@example.com',
       role: UserRole.USER,
       status: UserStatus.ACTIVE,
+      environment: {
+        displayMode: 'MAINNET',
+        mainnetOnly: true,
+        hyperliquidTestnet: false,
+      },
     });
   });
 

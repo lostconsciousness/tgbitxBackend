@@ -92,6 +92,49 @@ export class OrdersService {
     });
   }
 
+  async listUserOpenOrders(userId: string) {
+    const orders = await this.prisma.order.findMany({
+      where: {
+        userId,
+        status: {
+          in: [
+            OrderStatus.ROUTED,
+            OrderStatus.OPEN,
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.PROVIDER_PENDING,
+          ],
+        },
+      },
+      select: {
+        id: true,
+        clientOrderId: true,
+        side: true,
+        type: true,
+        status: true,
+        route: true,
+        size: true,
+        filledSize: true,
+        price: true,
+        averageFillPrice: true,
+        triggerPrice: true,
+        leverage: true,
+        reduceOnly: true,
+        createdAt: true,
+        updatedAt: true,
+        market: { select: { id: true, symbol: true, type: true } },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    });
+    return orders.map((order) => ({
+      ...order,
+      size: order.size.toString(),
+      filledSize: order.filledSize.toString(),
+      price: order.price?.toString() ?? null,
+      averageFillPrice: order.averageFillPrice?.toString() ?? null,
+      triggerPrice: order.triggerPrice?.toString() ?? null,
+    }));
+  }
+
   async getExecutionReadiness() {
     const [tradingPaused, aBookReconciliationPaused, bbookPaused, exposures] = await Promise.all([
       this.settings.getBoolean('trading:paused', 'TRADING_PAUSED', false),

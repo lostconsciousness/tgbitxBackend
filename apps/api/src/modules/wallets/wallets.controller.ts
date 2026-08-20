@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Header,
   HttpCode,
   HttpStatus,
   Param,
@@ -44,6 +45,7 @@ export class WalletsController {
   ) {}
 
   @Get()
+  @Header('Cache-Control', 'private, max-age=60, stale-while-revalidate=300')
   @ApiOperation({ summary: 'List current user wallets' })
   list(@CurrentUser() user: AuthenticatedUser) {
     return this.walletsService.listUserWallets(user.id);
@@ -55,6 +57,24 @@ export class WalletsController {
   })
   balances(@CurrentUser() user: AuthenticatedUser) {
     return this.accountService.getConnectedWalletBalancesForUser(user.id);
+  }
+
+  @Get('onchain-balances')
+  @Header('Cache-Control', 'private, max-age=15, stale-while-revalidate=60')
+  @ApiOperation({
+    summary: 'Lazily load balances held on current user personal deposit addresses',
+  })
+  onChainBalances(@CurrentUser() user: AuthenticatedUser) {
+    return this.accountService.getPersonalDepositOnChainBalancesForUser(user.id);
+  }
+
+  @Get('connected-balances')
+  @Header('Cache-Control', 'private, max-age=30, stale-while-revalidate=120')
+  @ApiOperation({
+    summary: 'Lazily load compact on-chain balances for connected wallets',
+  })
+  connectedBalances(@CurrentUser() user: AuthenticatedUser) {
+    return this.accountService.getConnectedWalletBalancesCompactForUser(user.id);
   }
 
   @Get('capabilities')

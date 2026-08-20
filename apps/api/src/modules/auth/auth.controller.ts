@@ -1,4 +1,5 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Post, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Header, HttpCode, HttpStatus, Post, Req, UseGuards } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   ApiBearerAuth,
   ApiOkResponse,
@@ -22,7 +23,10 @@ import { RegisterDto } from './dto/register.dto';
 @ApiTags('auth')
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly config: ConfigService,
+  ) {}
 
   @Post('register')
   @Throttle({ default: { limit: 5, ttl: 60_000 } })
@@ -61,15 +65,29 @@ export class AuthController {
   @Get('me')
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
+  @Header('Cache-Control', 'private, max-age=60, stale-while-revalidate=300')
   @ApiOperation({ summary: 'Get current authenticated user' })
-  @ApiOkResponse({ type: UserResponseDto })
-  me(@CurrentUser() user: AuthenticatedUser): UserResponseDto {
+  me(@CurrentUser() user: AuthenticatedUser): UserResponseDto & {
+    environment: {
+      displayMode: 'MAINNET' | 'TESTNET';
+      mainnetOnly: boolean;
+      hyperliquidTestnet: boolean;
+    };
+  } {
+    const mainnetOnly =
+      this.config.get<boolean>('DISPLAY_MAINNET_ONLY', false) ||
+      this.config.get<boolean>('MAINNET_ENABLED', false);
     return {
       id: user.id,
       email: user.email,
       role: user.role,
       status: user.status,
       createdAt: user.createdAt,
+      environment: {
+        displayMode: mainnetOnly ? 'MAINNET' : 'TESTNET',
+        mainnetOnly,
+        hyperliquidTestnet: this.config.get<boolean>('HYPERLIQUID_TESTNET', true),
+      },
     };
   }
 }

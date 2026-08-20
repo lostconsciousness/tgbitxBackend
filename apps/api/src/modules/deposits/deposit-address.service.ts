@@ -35,6 +35,42 @@ export class DepositAddressService {
     private readonly alchemyAddresses: AlchemyWebhookAddressSyncService,
   ) {}
 
+  async listUser(userId: string) {
+    const addresses = await this.prisma.userDepositAddress.findMany({
+      where: { userId, status: UserDepositAddressStatus.ACTIVE },
+      select: {
+        id: true,
+        network: true,
+        address: true,
+        status: true,
+        createdAt: true,
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    });
+    const networks = await this.prisma.network.findMany({
+      where: { legacyChain: { in: [...new Set(addresses.map((entry) => entry.network))] } },
+      select: { chainKey: true, legacyChain: true, family: true },
+    });
+    const networkByLegacyChain = new Map(
+      networks
+        .filter((network) => network.legacyChain)
+        .map((network) => [network.legacyChain!, network]),
+    );
+    return addresses.map((entry) => {
+      const network = networkByLegacyChain.get(entry.network);
+      return {
+        id: entry.id,
+        network: network?.chainKey ?? entry.network.toLowerCase(),
+        address:
+          network?.family === NetworkFamily.EVM
+            ? getAddress(entry.address)
+            : entry.address,
+        status: entry.status,
+        createdAt: entry.createdAt,
+      };
+    });
+  }
+
   async provision(userId: string, assetSymbol: string, networkKey?: string) {
     const target = await this.getEligibleTarget(assetSymbol, networkKey);
     const network = target.legacyChain;

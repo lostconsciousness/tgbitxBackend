@@ -11,6 +11,7 @@ import {
   MarketType,
   Network,
   NetworkFamily,
+  PositionStatus,
   Prisma,
   TokenStandard,
   UserDepositAddress,
@@ -143,7 +144,9 @@ export class AccountService implements OnModuleDestroy {
     if (cachedOverview) {
       return {
         ...cachedOverview,
-        positions: await this.positions.listUserPositions(userId),
+        positions: await this.positions.listUserPositions(userId, {
+          status: PositionStatus.OPEN,
+        }),
       };
     }
 
@@ -193,7 +196,7 @@ export class AccountService implements OnModuleDestroy {
         include: { asset: true, tokenContract: { include: { network: true } } },
         orderBy: { createdAt: 'desc' },
       }),
-      this.positions.listUserPositions(userId),
+      this.positions.listUserPositions(userId, { status: PositionStatus.OPEN }),
     ]);
     const networkByLegacyChain = this.mapNetworksByLegacyChain(networks);
     const visibleNetworks = this.filterDisplayNetworks(networks);
@@ -340,6 +343,86 @@ export class AccountService implements OnModuleDestroy {
       value,
     });
     return value;
+  }
+
+  async getConnectedWalletBalancesCompactForUser(userId: string) {
+    const entries = await this.getConnectedWalletBalancesForUser(userId);
+    return entries.map((entry) => ({
+      wallet: entry.wallet,
+      networks: entry.networks.map((networkEntry) => ({
+        network: networkEntry.network.network,
+        status: networkEntry.status,
+        assets: networkEntry.assets.map((asset) => ({
+          symbol: asset.symbol,
+          balance: asset.balance,
+          priceUsdc: asset.priceUsdc,
+          balanceUsdc: asset.balanceUsdc,
+          priceStatus: asset.priceStatus,
+          status: asset.status,
+        })),
+      })),
+      totalBalanceUsdc: entry.totalBalanceUsdc,
+      priceStatus: entry.priceStatus,
+    }));
+  }
+
+  async getPersonalDepositOnChainBalancesForUser(userId: string) {
+    const [networks, depositAddresses, assets] = await Promise.all([
+      this.prisma.network.findMany({ orderBy: { chainKey: 'asc' } }),
+      this.prisma.userDepositAddress.findMany({
+        where: { userId, status: UserDepositAddressStatus.ACTIVE },
+        orderBy: { createdAt: 'desc' },
+      }),
+      this.prisma.asset.findMany({
+        include: { tokenContracts: { include: { network: true } } },
+        orderBy: { symbol: 'asc' },
+      }),
+    ]);
+    const visibleNetworks = this.filterDisplayNetworks(networks);
+    const visibleNetworkKeys = new Set(visibleNetworks.map((network) => network.chainKey));
+    const displayAssets = this.filterDisplayAssets(assets);
+    const contracts = this.buildOnChainTokenContracts(displayAssets, visibleNetworkKeys);
+    const networkByLegacyChain = this.mapNetworksByLegacyChain(visibleNetworks);
+    const snapshot = await this.getPersonalDepositOnChainSnapshot({
+      userId,
+      depositAddresses,
+      tokenContracts: contracts,
+      networks: visibleNetworks,
+      displayAssets,
+    });
+
+    return snapshot.balances
+      .filter((target) => target.source === 'PERSONAL_DEPOSIT_ADDRESS')
+      .map((target) => ({
+        source: target.source,
+        depositAddressId: target.depositAddressId,
+        address: target.address,
+        network:
+          networkByLegacyChain.get(target.chain)?.chainKey ??
+          legacyChainToNetworkKey(target.chain),
+        status: target.status,
+        balances: target.balances
+          .filter((balance) =>
+            !this.isOperationalGasDustOnDepositAddress(target.source, balance),
+          )
+          .map((balance) => ({
+            assetId: 'id' in balance.asset ? balance.asset.id : undefined,
+            symbol: balance.asset.symbol,
+            balance: balance.balance,
+            status: balance.status,
+          })),
+      }))
+      .filter((target) => target.balances.length > 0);
+  }
+
+  async getPortfolioSummaryForUser(userId: string) {
+    const balances = await this.ledgerService.listUserSpotBalances(userId, {
+      mainnetOnly: this.isMainnetDisplayMode(),
+    });
+    const portfolio = await this.buildPortfolio(
+      balances.filter((balance) => new Prisma.Decimal(balance.total).greaterThan(0)),
+    );
+    return this.toPortfolioSummary(portfolio);
   }
 
   private async loadConnectedWalletBalancesForUser(userId: string) {

@@ -754,6 +754,45 @@ export class DepositsService {
     });
   }
 
+  async listActiveIntents(userId: string) {
+    const intents = await this.prisma.depositIntent.findMany({
+      where: {
+        userId,
+        status: {
+          in: [
+            DepositIntentStatus.PENDING,
+            DepositIntentStatus.SUBMITTED,
+            DepositIntentStatus.DETECTED,
+            DepositIntentStatus.CONFIRMED,
+          ],
+        },
+      },
+      select: {
+        id: true,
+        walletId: true,
+        network: true,
+        fromAddress: true,
+        treasuryAddress: true,
+        amount: true,
+        rawAmount: true,
+        txHash: true,
+        status: true,
+        expiresAt: true,
+        createdAt: true,
+        updatedAt: true,
+        asset: {
+          select: { id: true, symbol: true, decimals: true },
+        },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 50,
+    });
+    return intents.map((intent) => ({
+      ...intent,
+      amount: intent.amount.toString(),
+    }));
+  }
+
   listAdminDeposits(take = 100) {
     return this.prisma.deposit.findMany({
       take: Math.min(take, 200),

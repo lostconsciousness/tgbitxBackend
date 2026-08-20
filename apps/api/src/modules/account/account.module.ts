@@ -7,10 +7,11 @@ import { OnchainModule } from '../onchain/onchain.module';
 import { AccountController } from './account.controller';
 import { AccountService } from './account.service';
 import { AssetValuationService } from './asset-valuation.service';
+import { PortfolioController } from './portfolio.controller';
 
 @Module({
   imports: [LedgerModule, MarketDataModule, RpcModule, OnchainModule, PositionsModule],
-  controllers: [AccountController],
+  controllers: [AccountController, PortfolioController],
   providers: [AccountService, AssetValuationService],
   exports: [AccountService, AssetValuationService],
 })
