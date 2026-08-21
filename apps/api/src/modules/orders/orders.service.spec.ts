@@ -22,7 +22,7 @@ jest.mock('../hyperliquid/hyperliquid-order-format', () => ({
   formatHyperliquidSize: (size: string) => size,
 }));
 
-import { LedgerService } from '../ledger/ledger.service';
+import { LedgerPostingEntry, LedgerService } from '../ledger/ledger.service';
 import { MarketDataService } from '../market-data/market-data.service';
 import { MarketsService } from '../markets/markets.service';
 import { RoutingService } from '../routing/routing.service';
@@ -341,6 +341,42 @@ describe('OrdersService provider recovery', () => {
     providerSymbol: 'BTC',
     quoteAssetId: 'asset-usdc',
   };
+
+  it('keeps close settlement balanced at full ledger precision', async () => {
+    const ledger = {
+      postTransaction: jest.fn(async (posting: { entries: LedgerPostingEntry[] }) => {
+        assertBalancedLedgerEntries(posting.entries);
+        return { id: 'settlement-ledger-1' };
+      }),
+    };
+    const service = new OrdersService(
+      {} as PrismaService,
+      {} as ConfigService,
+      {} as MarketsService,
+      {} as MarketDataService,
+      {} as RoutingService,
+      ledger as unknown as LedgerService,
+      {} as HyperliquidExecutionService,
+      {} as OperationalSettingsService,
+    );
+
+    await expect(service.settlePositionLedger({} as Prisma.TransactionClient, {
+      idempotencyKey: 'position-close:production-regression',
+      userId: 'user-1',
+      assetId: 'asset-usdc',
+      route: ExecutionRoute.A_BOOK_HYPERLIQUID,
+      margin: new Prisma.Decimal('107.674838500000000000'),
+      pnl: new Prisma.Decimal('-1.233849999999999985'),
+      fee: new Prisma.Decimal('0.537954532500000000'),
+    })).resolves.toEqual({ id: 'settlement-ledger-1' });
+
+    const posting = ledger.postTransaction.mock.calls[0]?.[0];
+    const payout = posting?.entries.find((entry) =>
+      entry.accountType === LedgerAccountType.USER_SPOT);
+    expect(new Prisma.Decimal(payout?.amount ?? 0).toFixed(18)).toBe(
+      '105.903033967500000015',
+    );
+  });
 
   it('terminalizes a provider margin rejection instead of retrying it forever', async () => {
     const order = {
@@ -1296,9 +1332,17 @@ describe('OrdersService spot orders', () => {
     expect(tx.order.create).not.toHaveBeenCalled();
   });
 
-  it('rejects duplicate client order ids before creating another order', async () => {
+  it('returns an existing order for an idempotent client order replay', async () => {
     const { service, prisma, markets } = createSpotHarness();
-    prisma.order.findUnique.mockResolvedValueOnce({ id: 'existing-order' });
+    const existingOrder = {
+      id: 'existing-order',
+      clientOrderId: 'client-buy-1',
+      status: OrderStatus.PROVIDER_PENDING,
+      market: spotMarket,
+      providerOrder: null,
+      trades: [],
+    };
+    prisma.order.findUnique.mockResolvedValueOnce(existingOrder);
 
     await expect(service.createOrder('user-1', {
       symbol: 'BTC-USDC',
@@ -1306,7 +1350,7 @@ describe('OrdersService spot orders', () => {
       side: OrderSide.BUY,
       type: OrderType.MARKET,
       size: '2',
-    })).rejects.toThrow('Duplicate client order id');
+    })).resolves.toBe(existingOrder);
 
     expect(markets.getBySymbol).not.toHaveBeenCalled();
   });

@@ -25,6 +25,7 @@ import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../database/prisma.service';
 import { HyperliquidExecutionService } from '../hyperliquid/hyperliquid-execution.service';
 import { LedgerPostingEntry, LedgerService } from '../ledger/ledger.service';
+import { toLedgerDecimal } from '../ledger/ledger.validator';
 import { MarketDataService } from '../market-data/market-data.service';
 import { MarketsService } from '../markets/markets.service';
 import { RoutingService } from '../routing/routing.service';
@@ -238,14 +239,26 @@ export class OrdersService {
       liquidationInsuranceFee: Prisma.Decimal;
     },
   ) {
+    const existingOrder = await this.findOrderByClientId(userId, dto.clientOrderId);
+    if (existingOrder) {
+      // POST /orders is idempotent by clientOrderId. A provider fill may have
+      // committed even when the original HTTP request timed out or settlement
+      // reconciliation was still pending; replaying the request must return
+      // that order instead of creating another one or surfacing a misleading
+      // duplicate-id error.
+      return existingOrder;
+    }
     if (await this.settings.getBoolean('trading:paused', 'TRADING_PAUSED', false)) {
       throw new ServiceUnavailableException('Trading is paused');
     }
-    await this.assertUniqueClientOrderId(userId, dto.clientOrderId);
     const market = await this.markets.getBySymbol(dto.symbol);
     let size = new Prisma.Decimal(dto.size);
     if (!dto.useAvailableBalance && size.lessThan(market.minOrderSize)) {
-      throw new BadRequestException('Order size is below market minimum');
+      throw new BadRequestException({
+        code: 'ORDER_SIZE_BELOW_MARKET_MINIMUM',
+        message: 'Order size is below market minimum',
+        minOrderSize: market.minOrderSize.toString(),
+      });
     }
     if (
       dto.type === OrderType.LIMIT &&
@@ -454,7 +467,11 @@ export class OrdersService {
       }
     }
     if (size.lessThan(market.minOrderSize)) {
-      throw new BadRequestException('Order size is below market minimum');
+      throw new BadRequestException({
+        code: 'ORDER_SIZE_BELOW_MARKET_MINIMUM',
+        message: 'Order size is below market minimum',
+        minOrderSize: market.minOrderSize.toString(),
+      });
     }
     const notional = size.mul(mark);
     if (!dto.reduceOnly && minNotional.greaterThan(0) && notional.lessThan(minNotional)) {
@@ -2709,44 +2726,52 @@ export class OrdersService {
       input.route === ExecutionRoute.B_BOOK_INTERNAL
         ? LedgerAccountType.PLATFORM_BBOOK
         : LedgerAccountType.PROVIDER_CLEARING;
-    const settlement = input.margin.plus(input.pnl);
-    const requestedPlatformFee = input.platformFee ?? input.fee;
-    const requestedInsuranceFee = input.insuranceFee ?? new Prisma.Decimal(0);
+    const zero = toLedgerDecimal(0);
+    const margin = toLedgerDecimal(input.margin);
+    const pnl = toLedgerDecimal(input.pnl);
+    const settlement = margin.plus(pnl);
+    const requestedPlatformFee = toLedgerDecimal(input.platformFee ?? input.fee);
+    const requestedInsuranceFee = toLedgerDecimal(
+      input.insuranceFee ?? 0,
+    );
     // A liquidation quote is calculated from the trigger mark, while the
     // provider fill can be worse. Fees may therefore exceed the equity that is
     // actually left at execution. Only collect fees from non-negative equity;
     // otherwise the posting becomes unbalanced and the provider fill can never
     // be reconciled.
-    const availableForFees = Prisma.Decimal.max(0, settlement);
-    const platformFee = Prisma.Decimal.min(requestedPlatformFee, availableForFees);
-    const insuranceFee = Prisma.Decimal.min(
-      requestedInsuranceFee,
-      Prisma.Decimal.max(0, availableForFees.minus(platformFee)),
-    );
-    const payout = Prisma.Decimal.max(0, settlement.minus(platformFee).minus(insuranceFee));
-    const deficit = Prisma.Decimal.max(0, settlement.negated());
+    const availableForFees = settlement.greaterThan(0) ? settlement : zero;
+    const platformFee = requestedPlatformFee.lessThan(availableForFees)
+      ? requestedPlatformFee
+      : availableForFees;
+    const remainingForInsurance = availableForFees.minus(platformFee);
+    const insuranceFee = requestedInsuranceFee.lessThan(remainingForInsurance)
+      ? requestedInsuranceFee
+      : remainingForInsurance;
+    const payoutBeforeClamp = settlement.minus(platformFee).minus(insuranceFee);
+    const payout = payoutBeforeClamp.greaterThan(0) ? payoutBeforeClamp : zero;
+    const deficit = settlement.lessThan(0) ? settlement.negated() : zero;
     const entries: LedgerPostingEntry[] = [
       {
         accountType: LedgerAccountType.USER_PERP_MARGIN,
         userId: input.userId,
         assetId: input.assetId,
         direction: LedgerEntryDirection.DEBIT,
-        amount: input.margin,
+        amount: margin,
       },
     ];
-    if (input.pnl.greaterThan(0)) {
+    if (pnl.greaterThan(0)) {
       entries.push({
         accountType: platformAccount,
         assetId: input.assetId,
         direction: LedgerEntryDirection.DEBIT,
-        amount: input.pnl,
+        amount: pnl,
       });
-    } else if (input.pnl.lessThan(0)) {
+    } else if (pnl.lessThan(0)) {
       entries.push({
         accountType: platformAccount,
         assetId: input.assetId,
         direction: LedgerEntryDirection.CREDIT,
-        amount: input.pnl.abs(),
+        amount: pnl.abs(),
       });
     }
     if (deficit.greaterThan(0)) {
@@ -2893,19 +2918,16 @@ export class OrdersService {
     });
   }
 
-  private async assertUniqueClientOrderId(userId: string, clientOrderId: string) {
-    const existing = await this.prisma.order.findUnique({
+  private findOrderByClientId(userId: string, clientOrderId: string) {
+    return this.prisma.order.findUnique({
       where: {
         userId_clientOrderId: {
           userId,
           clientOrderId,
         },
       },
-      select: { id: true },
+      include: { market: true, providerOrder: true, trades: true },
     });
-    if (existing) {
-      throw new BadRequestException('Duplicate client order id');
-    }
   }
 
   private calculateLiquidationPrice(

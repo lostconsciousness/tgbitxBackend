@@ -9,7 +9,12 @@ import {
   WithdrawalStatus,
 } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
-import { assertBalancedLedgerEntries, calculateAccountBalance, toDecimal } from './ledger.validator';
+import {
+  assertBalancedLedgerEntries,
+  calculateAccountBalance,
+  toDecimal,
+  toLedgerDecimal,
+} from './ledger.validator';
 
 export type LedgerPostingEntry = {
   accountType: LedgerAccountType;
@@ -48,7 +53,7 @@ export class LedgerService {
 
     const entries = input.entries.map((entry) => ({
       ...entry,
-      amount: toDecimal(entry.amount),
+      amount: toLedgerDecimal(entry.amount),
     }));
 
     assertBalancedLedgerEntries(entries);
