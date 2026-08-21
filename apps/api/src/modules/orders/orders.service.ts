@@ -2379,8 +2379,10 @@ export class OrdersService {
   ) {
     const notional = input.size.mul(input.price);
     let feeSettledWithClose = new Prisma.Decimal(0);
+    let realizedPnl = new Prisma.Decimal(0);
     if (input.reduceOnly) {
-      await this.closePositionWithFill(tx, input, notional);
+      const closeResult = await this.closePositionWithFill(tx, input, notional);
+      realizedPnl = closeResult.realizedPnl;
     } else {
       const side =
         input.side === OrderSide.BUY ? PositionSide.LONG : PositionSide.SHORT;
@@ -2397,12 +2399,13 @@ export class OrdersService {
         const closeRatio = closeSize.div(input.size);
         const closeFee = input.fee.mul(closeRatio);
         const closeOrderMargin = input.margin.mul(closeRatio);
-        await this.closePositionWithFill(tx, {
+        const closeResult = await this.closePositionWithFill(tx, {
           ...input,
           size: closeSize,
           fee: closeFee,
           settlement: undefined,
         }, closeSize.mul(input.price));
+        realizedPnl = closeResult.realizedPnl;
         await this.releaseNettedOrderMargin(tx, input, closeOrderMargin);
         feeSettledWithClose = closeFee;
 
@@ -2521,6 +2524,7 @@ export class OrdersService {
         size: input.size,
         notional,
         feeAmount: input.fee,
+        realizedPnl,
         executedAt: new Date(),
       },
     });
@@ -2705,6 +2709,7 @@ export class OrdersService {
         },
       });
     }
+    return { realizedPnl };
   }
 
   async settlePositionLedger(

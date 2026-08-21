@@ -1674,8 +1674,10 @@ describe('OrdersService perp trigger orders', () => {
       data: expect.objectContaining({
         orderId: 'order-trigger-1',
         side: OrderSide.SELL,
+        realizedPnl: expect.anything(),
       }),
     });
+    expect(tx.trade.create.mock.calls[0][0].data.realizedPnl.toString()).toBe('-10');
   });
 
   it('does not duplicate-fill a trigger order already claimed elsewhere', async () => {

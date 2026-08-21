@@ -30,6 +30,7 @@
     "spot:onboard-assets": "ts-node scripts/onboard-oneinch-spot-assets.ts",
     "spot:recover-legacy-inventory": "ts-node scripts/recover-legacy-spot-inventory.ts",
     "tron:recover-deposits": "ts-node scripts/recover-tron-deposits.ts",
+    "trades:backfill-realized-pnl": "ts-node scripts/backfill-trade-realized-pnl.ts",
     "sol:fund-hot-from-deposit": "ts-node scripts/fund-sol-hot-from-deposit.ts",
     "test:watch": "jest --watch --config jest.config.js",
     "prisma:generate": "prisma generate",
