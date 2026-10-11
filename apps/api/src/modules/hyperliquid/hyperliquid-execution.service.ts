@@ -12,6 +12,17 @@ import {
 import { PrivyCustodyService } from '../treasury/privy-custody.service';
 import { formatHyperliquidPrice, formatHyperliquidSize } from './hyperliquid-order-format';
 
+export interface HyperliquidLiquidationFill {
+  providerFillId: string;
+  providerOrderId: string;
+  providerSymbol: string;
+  positionSide: 'LONG' | 'SHORT';
+  price: string;
+  size: string;
+  feeAmount: string;
+  occurredAt: Date;
+}
+
 @Injectable()
 export class HyperliquidExecutionService implements PerpLiquidityProvider {
   private readonly logger = new Logger(HyperliquidExecutionService.name);
@@ -284,6 +295,35 @@ export class HyperliquidExecutionService implements PerpLiquidityProvider {
       return { supported: false };
     }
     return client.userFills({ user: address as `0x${string}` });
+  }
+
+  async getLiquidationFills(): Promise<HyperliquidLiquidationFill[]> {
+    return this.withProviderResilience('getLiquidationFills', true, async () => {
+      const { info } = await this.createClients();
+      const master = this.config.getOrThrow<string>('HYPERLIQUID_MASTER_ADDRESS');
+      const fills = await info.userFills({
+        user: master as `0x${string}`,
+        aggregateByTime: false,
+      });
+      return fills.flatMap((fill) => {
+        if (
+          !fill.liquidation ||
+          fill.liquidation.liquidatedUser.toLowerCase() !== master.toLowerCase()
+        ) {
+          return [];
+        }
+        return [{
+          providerFillId: `hyperliquid:${fill.tid}`,
+          providerOrderId: String(fill.oid),
+          providerSymbol: fill.coin,
+          positionSide: fill.side === 'A' ? 'LONG' as const : 'SHORT' as const,
+          price: fill.px,
+          size: fill.sz,
+          feeAmount: fill.fee,
+          occurredAt: new Date(fill.time),
+        }];
+      });
+    });
   }
 
   private async createClients() {

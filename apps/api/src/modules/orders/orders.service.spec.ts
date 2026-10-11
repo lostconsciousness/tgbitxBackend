@@ -79,6 +79,98 @@ describe('calculateMaxAffordablePerpSize', () => {
   });
 });
 
+describe('OrdersService external provider liquidation settlement', () => {
+  it('atomically allocates an omnibus liquidation fill across matching user positions', async () => {
+    const positions = [
+      {
+        id: 'position-1', userId: 'user-1', marketId: 'market-eth',
+        side: PositionSide.LONG, size: new Prisma.Decimal('0.0069'),
+        entryPrice: new Prisma.Decimal('1574.6'), margin: new Prisma.Decimal('1.0864395'),
+        leverage: 10,
+      },
+      {
+        id: 'position-2', userId: 'user-2', marketId: 'market-eth',
+        side: PositionSide.LONG, size: new Prisma.Decimal('0.1937'),
+        entryPrice: new Prisma.Decimal('2681.4'), margin: new Prisma.Decimal('51.9377495'),
+        leverage: 10,
+      },
+    ];
+    let eventIndex = 0;
+    let orderIndex = 0;
+    const tx = {
+      $executeRawUnsafe: jest.fn(),
+      market: { findFirst: jest.fn().mockResolvedValue({
+        id: 'market-eth', type: MarketType.PERP, providerSymbol: 'ETH',
+        providerName: 'HYPERLIQUID', quoteAssetId: 'asset-usdc', sizePrecision: 4,
+      }) },
+      position: {
+        findMany: jest.fn().mockResolvedValue(positions),
+        update: jest.fn(),
+      },
+      liquidationEvent: {
+        create: jest.fn().mockImplementation(() => ({ id: `event-${++eventIndex}` })),
+        update: jest.fn(),
+      },
+      order: {
+        create: jest.fn().mockImplementation(() => ({ id: `order-${++orderIndex}` })),
+        updateMany: jest.fn(),
+      },
+      trade: { create: jest.fn() },
+    };
+    const writeConflict = new Prisma.PrismaClientKnownRequestError(
+      'Transaction failed due to a write conflict',
+      { code: 'P2034', clientVersion: 'test' },
+    );
+    const prisma = {
+      $transaction: jest.fn()
+        .mockRejectedValueOnce(writeConflict)
+        .mockImplementation(async (
+          callback: (client: typeof tx) => Promise<unknown>,
+        ) => callback(tx)),
+    };
+    const ledger = {
+      postTransaction: jest.fn().mockImplementation(({ idempotencyKey }: { idempotencyKey: string }) => ({
+        id: `ledger:${idempotencyKey}`,
+      })),
+    };
+    const updates = { publish: jest.fn() };
+    const service = new OrdersService(
+      prisma as unknown as PrismaService,
+      {} as ConfigService,
+      {} as MarketsService,
+      {} as MarketDataService,
+      {} as RoutingService,
+      ledger as unknown as LedgerService,
+      {} as HyperliquidExecutionService,
+      {} as OperationalSettingsService,
+      updates as never,
+    );
+
+    const result = await service.settleExternalProviderLiquidation({
+      providerFillId: 'hyperliquid:744857497390283',
+      providerOrderId: '567540270780',
+      providerSymbol: 'ETH',
+      positionSide: PositionSide.LONG,
+      price: '2572',
+      size: '0.2006',
+      feeAmount: '0.232174',
+      occurredAt: new Date('2026-10-07T10:07:40.259Z'),
+    });
+
+    expect(result).toMatchObject({ settled: true, positions: 2 });
+    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+    expect(ledger.postTransaction).toHaveBeenCalledTimes(2);
+    for (const [posting] of ledger.postTransaction.mock.calls) {
+      expect(posting.type).toBe(LedgerTransactionType.LIQUIDATION);
+      assertBalancedLedgerEntries(posting.entries);
+    }
+    expect(tx.trade.create).toHaveBeenCalledTimes(2);
+    expect(tx.position.update).toHaveBeenCalledTimes(2);
+    expect(tx.liquidationEvent.update).toHaveBeenCalledTimes(2);
+    expect(updates.publish).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('OrdersService open orders', () => {
   it('queries only actionable statuses and returns compact decimal strings', async () => {
     const findMany = jest.fn().mockResolvedValue([{

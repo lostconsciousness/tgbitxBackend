@@ -10,6 +10,7 @@ import {
   LedgerAccountType,
   LedgerEntryDirection,
   LedgerTransactionType,
+  LiquidationStatus,
   MarketStatus,
   MarketType,
   OrderSide,
@@ -67,6 +68,17 @@ export function isFeeOnlyBalanceShortfall(input: {
 }): boolean {
   return input.margin.lessThanOrEqualTo(input.availableBalance) &&
     input.margin.plus(input.fee).greaterThan(input.availableBalance);
+}
+
+export interface ExternalProviderLiquidationFill {
+  providerFillId: string;
+  providerOrderId: string;
+  providerSymbol: string;
+  positionSide: PositionSide;
+  price: Prisma.Decimal.Value;
+  size: Prisma.Decimal.Value;
+  feeAmount: Prisma.Decimal.Value;
+  occurredAt: Date;
 }
 
 @Injectable()
@@ -2817,6 +2829,195 @@ export class OrdersService {
       idempotencyKey: input.idempotencyKey,
       entries,
     }, tx);
+  }
+
+  async settleExternalProviderLiquidation(
+    fill: ExternalProviderLiquidationFill,
+  ): Promise<{ settled: boolean; positions: number; userIds: string[]; reason?: string }> {
+    const result = await this.runSerializableTransaction(async (tx) => {
+      await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(742662002)');
+      const market = await tx.market.findFirst({
+        where: {
+          providerName: 'HYPERLIQUID',
+          providerSymbol: fill.providerSymbol,
+          type: MarketType.PERP,
+        },
+      });
+      if (!market) {
+        return { settled: false, positions: 0, userIds: [], reason: 'MARKET_NOT_FOUND' };
+      }
+      const positions = await tx.position.findMany({
+        where: {
+          marketId: market.id,
+          route: ExecutionRoute.A_BOOK_HYPERLIQUID,
+          status: PositionStatus.OPEN,
+          side: fill.positionSide,
+          openedAt: { lte: fill.occurredAt },
+        },
+        orderBy: [{ openedAt: 'asc' }, { id: 'asc' }],
+      });
+      if (positions.length === 0) {
+        return { settled: false, positions: 0, userIds: [], reason: 'NO_OPEN_POSITIONS' };
+      }
+      const fillSize = new Prisma.Decimal(fill.size);
+      const internalSize = positions.reduce(
+        (sum, position) => sum.plus(position.size),
+        new Prisma.Decimal(0),
+      );
+      const tolerance = new Prisma.Decimal(10).pow(-market.sizePrecision);
+      if (internalSize.minus(fillSize).abs().greaterThan(tolerance)) {
+        return {
+          settled: false,
+          positions: positions.length,
+          userIds: [],
+          reason: `SIZE_MISMATCH:${internalSize.toString()}:${fillSize.toString()}`,
+        };
+      }
+
+      const price = new Prisma.Decimal(fill.price);
+      const totalFee = new Prisma.Decimal(fill.feeAmount);
+      let allocatedFee = new Prisma.Decimal(0);
+      const userIds: string[] = [];
+      for (const [index, position] of positions.entries()) {
+        const isLast = index === positions.length - 1;
+        const fee = isLast
+          ? totalFee.minus(allocatedFee)
+          : totalFee.mul(position.size).div(fillSize);
+        allocatedFee = allocatedFee.plus(fee);
+        const pnlPerUnit = position.side === PositionSide.LONG
+          ? price.minus(position.entryPrice)
+          : new Prisma.Decimal(position.entryPrice).minus(price);
+        const realizedPnl = pnlPerUnit.mul(position.size);
+        const liquidation = await tx.liquidationEvent.create({
+          data: {
+            positionId: position.id,
+            marketId: market.id,
+            status: LiquidationStatus.CLOSING,
+            markPrice: price,
+            positionSize: position.size,
+            collateralBefore: position.margin,
+            realizedPnl,
+            liquidationFee: fee,
+            platformFee: fee,
+            insuranceFee: 0,
+            failureReason: `External Hyperliquid liquidation ${fill.providerOrderId}`,
+            triggeredAt: fill.occurredAt,
+          },
+        });
+        const order = await tx.order.create({
+          data: {
+            userId: position.userId,
+            marketId: market.id,
+            clientOrderId: `provider-liquidation:${fill.providerFillId}:${position.id}`,
+            side: position.side === PositionSide.LONG ? OrderSide.SELL : OrderSide.BUY,
+            type: OrderType.MARKET,
+            status: OrderStatus.FILLED,
+            route: ExecutionRoute.A_BOOK_HYPERLIQUID,
+            size: position.size,
+            filledSize: position.size,
+            averageFillPrice: price,
+            leverage: position.leverage,
+            reduceOnly: true,
+            marginReserved: 0,
+            feeAmount: fee,
+            liquidationEventId: liquidation.id,
+            createdAt: fill.occurredAt,
+          },
+        });
+        const ledgerTransaction = await this.settlePositionLedger(tx, {
+          idempotencyKey: `provider-liquidation:${fill.providerFillId}:${position.id}`,
+          userId: position.userId,
+          assetId: market.quoteAssetId,
+          route: ExecutionRoute.A_BOOK_HYPERLIQUID,
+          margin: position.margin,
+          pnl: realizedPnl,
+          fee,
+          platformFee: fee,
+          insuranceFee: new Prisma.Decimal(0),
+          transactionType: LedgerTransactionType.LIQUIDATION,
+        });
+        await tx.trade.create({
+          data: {
+            userId: position.userId,
+            orderId: order.id,
+            marketId: market.id,
+            providerFillId: `provider-liquidation:${fill.providerFillId}:${position.id}`,
+            route: ExecutionRoute.A_BOOK_HYPERLIQUID,
+            side: position.side === PositionSide.LONG ? OrderSide.SELL : OrderSide.BUY,
+            price,
+            size: position.size,
+            notional: new Prisma.Decimal(position.size).mul(price),
+            feeAmount: fee,
+            realizedPnl,
+            executedAt: fill.occurredAt,
+          },
+        });
+        await tx.position.update({
+          where: { id: position.id },
+          data: {
+            size: 0,
+            margin: 0,
+            realizedPnl: { increment: realizedPnl },
+            unrealizedPnl: 0,
+            status: PositionStatus.LIQUIDATED,
+            closedAt: fill.occurredAt,
+            markPrice: price,
+          },
+        });
+        await tx.liquidationEvent.update({
+          where: { id: liquidation.id },
+          data: {
+            status: LiquidationStatus.COMPLETED,
+            ledgerTransactionId: ledgerTransaction.id,
+            completedAt: fill.occurredAt,
+          },
+        });
+        await tx.order.updateMany({
+          where: {
+            id: { not: order.id },
+            userId: position.userId,
+            marketId: market.id,
+            status: OrderStatus.OPEN,
+            type: { in: [OrderType.STOP_LOSS, OrderType.TAKE_PROFIT] },
+            reduceOnly: true,
+          },
+          data: {
+            status: OrderStatus.CANCELLED,
+            rejectionReason: 'Position liquidated by provider',
+          },
+        });
+        userIds.push(position.userId);
+      }
+      return { settled: true, positions: positions.length, userIds };
+    });
+
+    if (result.settled) {
+      for (const userId of new Set(result.userIds)) {
+        this.publishTradingUpdate(userId);
+      }
+    }
+    return result;
+  }
+
+  private async runSerializableTransaction<T>(
+    operation: (tx: Prisma.TransactionClient) => Promise<T>,
+    maxAttempts = 5,
+  ): Promise<T> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        return await this.prisma.$transaction(operation, {
+          isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        });
+      } catch (error) {
+        const retryable = error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === 'P2034';
+        if (!retryable || attempt === maxAttempts) {
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, attempt * 25));
+      }
+    }
+    throw new Error('Serializable transaction retry loop exhausted unexpectedly');
   }
 
   private async updateExposure(

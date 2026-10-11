@@ -14,6 +14,7 @@ import { TreasuryService } from '../treasury/treasury.service';
 import { HyperliquidExecutionService } from '../hyperliquid/hyperliquid-execution.service';
 import { calculateAccountBalance } from '../ledger/ledger.validator';
 import { OperationalSettingsService } from '../settings/operational-settings.service';
+import { OrdersService } from '../orders/orders.service';
 
 @Injectable()
 export class ReconciliationService {
@@ -28,6 +29,7 @@ export class ReconciliationService {
     private readonly treasury: TreasuryService,
     private readonly hyperliquid: HyperliquidExecutionService,
     private readonly settings: OperationalSettingsService,
+    private readonly orders: OrdersService,
   ) {}
 
   @Cron(CronExpression.EVERY_HOUR)
@@ -230,6 +232,9 @@ export class ReconciliationService {
 
   async runProviderPositionsCheck() {
     return this.runCheck(ReconciliationType.PROVIDER_POSITIONS, async () => {
+      const providerLiquidationRecovery = this.hyperliquid.isExecutionEnabled()
+        ? await this.recoverProviderLiquidations()
+        : [];
       const internalPositions = await this.prisma.position.findMany({
         where: { status: PositionStatus.OPEN, route: 'A_BOOK_HYPERLIQUID' },
         include: { market: true },
@@ -342,11 +347,43 @@ export class ReconciliationService {
           providerPositionOffsets: [...providerPositionOffsets.entries()].map(
             ([symbol, size]) => ({ symbol, size: size.toString() }),
           ),
+          providerLiquidationRecovery,
           mismatches,
           pendingMismatches,
         },
       };
     });
+  }
+
+  private async recoverProviderLiquidations() {
+    const fills = await this.hyperliquid.getLiquidationFills();
+    const results = [] as Array<{
+      providerFillId: string;
+      providerSymbol: string;
+      settled: boolean;
+      positions: number;
+      reason?: string;
+    }>;
+    for (const fill of [...fills].sort(
+      (left, right) => left.occurredAt.getTime() - right.occurredAt.getTime(),
+    )) {
+      const result = await this.orders.settleExternalProviderLiquidation({
+        ...fill,
+        positionSide: fill.positionSide === 'LONG'
+          ? PositionSide.LONG
+          : PositionSide.SHORT,
+      });
+      if (result.settled || result.reason !== 'NO_OPEN_POSITIONS') {
+        results.push({
+          providerFillId: fill.providerFillId,
+          providerSymbol: fill.providerSymbol,
+          settled: result.settled,
+          positions: result.positions,
+          reason: result.reason,
+        });
+      }
+    }
+    return results;
   }
 
   async setProviderPositionOffset(symbol: string, size: Prisma.Decimal.Value) {

@@ -92,4 +92,50 @@ describe('HyperliquidExecutionService readiness', () => {
       withdrawable: '0',
     });
   });
+
+  it('returns only liquidation fills that liquidated the configured master account', async () => {
+    const service = createService([{ address: agent, validUntil: null }]);
+    const clients = await (service as unknown as { createClients: () => Promise<{
+      info: { userFills?: jest.Mock };
+    }> }).createClients();
+    clients.info.userFills = jest.fn().mockResolvedValue([
+      {
+        tid: 11,
+        oid: 21,
+        coin: 'ETH',
+        side: 'A',
+        px: '2572',
+        sz: '0.2006',
+        fee: '0.232174',
+        time: 1_000,
+        liquidation: { liquidatedUser: master, markPx: '2579.2', method: 'market' },
+      },
+      {
+        tid: 12,
+        oid: 22,
+        coin: 'BTC',
+        side: 'B',
+        px: '83637',
+        sz: '0.001',
+        fee: '0.037636',
+        time: 2_000,
+        liquidation: {
+          liquidatedUser: `0x${'3'.repeat(40)}`,
+          markPx: '83657',
+          method: 'market',
+        },
+      },
+    ]);
+
+    await expect(service.getLiquidationFills()).resolves.toEqual([{
+      providerFillId: 'hyperliquid:11',
+      providerOrderId: '21',
+      providerSymbol: 'ETH',
+      positionSide: 'LONG',
+      price: '2572',
+      size: '0.2006',
+      feeAmount: '0.232174',
+      occurredAt: new Date(1_000),
+    }]);
+  });
 });

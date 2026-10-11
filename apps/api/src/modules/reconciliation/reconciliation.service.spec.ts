@@ -9,6 +9,7 @@ import { HyperliquidExecutionService } from '../hyperliquid/hyperliquid-executio
 import { TreasuryService } from '../treasury/treasury.service';
 import { ReconciliationService } from './reconciliation.service';
 import { OperationalSettingsService } from '../settings/operational-settings.service';
+import { OrdersService } from '../orders/orders.service';
 
 describe('ReconciliationService provider checks', () => {
   it('fails provider order reconciliation when Hyperliquid is disabled but internal provider orders exist', async () => {
@@ -26,6 +27,7 @@ describe('ReconciliationService provider checks', () => {
       {} as TreasuryService,
       { isExecutionEnabled: jest.fn().mockReturnValue(false) } as unknown as HyperliquidExecutionService,
       { setBoolean: jest.fn() } as unknown as OperationalSettingsService,
+      {} as OrdersService,
     );
 
     const result = await service.runProviderOrdersCheck();
@@ -71,8 +73,10 @@ describe('ReconciliationService provider checks', () => {
         getAccountState: jest.fn().mockResolvedValue({
           assetPositions: [{ position: { coin: 'BTC', szi: '0.02' } }],
         }),
+        getLiquidationFills: jest.fn().mockResolvedValue([]),
       } as unknown as HyperliquidExecutionService,
       settings as unknown as OperationalSettingsService,
+      {} as OrdersService,
     );
 
     const now = jest.spyOn(Date, 'now');
@@ -127,8 +131,10 @@ describe('ReconciliationService provider checks', () => {
         getAccountState: jest.fn().mockResolvedValue({
           assetPositions: [{ position: { coin: 'BTC', szi: '-0.00156' } }],
         }),
+        getLiquidationFills: jest.fn().mockResolvedValue([]),
       } as unknown as HyperliquidExecutionService,
       settings as unknown as OperationalSettingsService,
+      {} as OrdersService,
     );
 
     const result = await service.runProviderPositionsCheck();
@@ -143,6 +149,71 @@ describe('ReconciliationService provider checks', () => {
         providerPositionOffsets: [{ symbol: 'BTC', size: '0.00003' }],
         mismatches: [],
         pendingMismatches: [],
+      },
+    });
+  });
+
+  it('settles confirmed master liquidation fills before comparing provider positions', async () => {
+    const prisma = {
+      reconciliationRun: {
+        create: jest.fn().mockResolvedValue({ id: 'run-4' }),
+        update: jest.fn().mockImplementation(({ data }: { data: unknown }) => data),
+      },
+      position: { findMany: jest.fn().mockResolvedValue([]) },
+    };
+    const settings = {
+      setBoolean: jest.fn(),
+      getDecimalsByPrefix: jest.fn().mockResolvedValue(new Map()),
+    };
+    const orders = {
+      settleExternalProviderLiquidation: jest.fn().mockResolvedValue({
+        settled: true,
+        positions: 2,
+        userIds: ['user-1', 'user-2'],
+      }),
+    };
+    const liquidationFill = {
+      providerFillId: 'hyperliquid:11',
+      providerOrderId: '21',
+      providerSymbol: 'ETH',
+      positionSide: 'LONG' as const,
+      price: '2572',
+      size: '0.2006',
+      feeAmount: '0.232174',
+      occurredAt: new Date('2026-10-07T10:07:40.259Z'),
+    };
+    const service = new ReconciliationService(
+      prisma as unknown as PrismaService,
+      {} as TreasuryService,
+      {
+        isExecutionEnabled: jest.fn().mockReturnValue(true),
+        getLiquidationFills: jest.fn().mockResolvedValue([liquidationFill]),
+        getAccountState: jest.fn().mockResolvedValue({ assetPositions: [] }),
+      } as unknown as HyperliquidExecutionService,
+      settings as unknown as OperationalSettingsService,
+      orders as unknown as OrdersService,
+    );
+
+    const result = await service.runProviderPositionsCheck();
+
+    expect(orders.settleExternalProviderLiquidation).toHaveBeenCalledWith({
+      ...liquidationFill,
+      positionSide: PositionSide.LONG,
+    });
+    expect(settings.setBoolean).toHaveBeenCalledWith(
+      'abook:reconciliation-paused',
+      false,
+    );
+    expect(result).toMatchObject({
+      status: ReconciliationStatus.PASSED,
+      details: {
+        providerLiquidationRecovery: [{
+          providerFillId: 'hyperliquid:11',
+          providerSymbol: 'ETH',
+          settled: true,
+          positions: 2,
+        }],
+        mismatches: [],
       },
     });
   });
