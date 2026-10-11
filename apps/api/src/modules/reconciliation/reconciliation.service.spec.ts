@@ -12,6 +12,50 @@ import { OperationalSettingsService } from '../settings/operational-settings.ser
 import { OrdersService } from '../orders/orders.service';
 
 describe('ReconciliationService provider checks', () => {
+  it('reports one-atomic-unit legacy ledger rounding separately from material imbalance', async () => {
+    const prisma = {
+      reconciliationRun: {
+        create: jest.fn().mockResolvedValue({ id: 'run-ledger' }),
+        update: jest.fn().mockImplementation(({ data }: { data: unknown }) => data),
+      },
+      ledgerTransaction: {
+        findMany: jest.fn().mockResolvedValue([
+          {
+            id: 'legacy-rounding',
+            entries: [
+              { assetId: 'usdc', direction: 'DEBIT', amount: '1' },
+              { assetId: 'usdc', direction: 'CREDIT', amount: '0.999999999999999999' },
+            ],
+          },
+          {
+            id: 'material-imbalance',
+            entries: [
+              { assetId: 'usdc', direction: 'DEBIT', amount: '1' },
+              { assetId: 'usdc', direction: 'CREDIT', amount: '0.99' },
+            ],
+          },
+        ]),
+      },
+    };
+    const service = new ReconciliationService(
+      prisma as unknown as PrismaService,
+      {} as TreasuryService,
+      {} as HyperliquidExecutionService,
+      {} as OperationalSettingsService,
+      {} as OrdersService,
+    );
+
+    const result = await service.runLedgerBalanceCheck();
+
+    expect(result).toMatchObject({
+      status: ReconciliationStatus.FAILED,
+      details: {
+        failedTransactionIds: ['material-imbalance'],
+        legacyRoundingTransactionIds: ['legacy-rounding'],
+      },
+    });
+  });
+
   it('fails provider order reconciliation when Hyperliquid is disabled but internal provider orders exist', async () => {
     const prisma = {
       reconciliationRun: {

@@ -745,6 +745,11 @@ describe('OrdersService provider recovery', () => {
       market,
       liquidationEvent: null,
     };
+    const staleEmbeddedOrder = {
+      ...order,
+      status: OrderStatus.PROVIDER_PENDING,
+      filledSize: new Prisma.Decimal(0),
+    };
     const providerOrder = {
       id: 'provider-partial-ioc',
       orderId: order.id,
@@ -752,7 +757,9 @@ describe('OrdersService provider recovery', () => {
       status: ProviderOrderStatus.PENDING,
       syncAttempts: 2,
       createdAt: new Date(),
-      order,
+      // The provider row is loaded before fills are applied. Its embedded order
+      // is therefore stale by the time the terminal snapshot is processed.
+      order: staleEmbeddedOrder,
     };
     const tx = {
       providerOrder: { update: jest.fn() },

@@ -57,6 +57,31 @@ export function assertBalancedLedgerEntries(entries: LedgerBalanceEntry[]): void
     throw new BadRequestException('Ledger transaction must have at least two entries');
   }
 
+  const totals = ledgerAtomicTotals(entries);
+
+  for (const [assetId, total] of totals.entries()) {
+    if (total.debit !== total.credit) {
+      throw new BadRequestException(`Ledger transaction is not balanced for asset ${assetId}`);
+    }
+  }
+}
+
+export function getLedgerAtomicImbalances(entries: LedgerBalanceEntry[]): Map<string, bigint> {
+  const totals = ledgerAtomicTotals(entries);
+  return new Map(
+    [...totals.entries()]
+      .map(([assetId, total]) => [assetId, total.debit - total.credit] as const)
+      .filter(([, imbalance]) => imbalance !== 0n),
+  );
+}
+
+function ledgerAtomicTotals(
+  entries: LedgerBalanceEntry[],
+): Map<string, { debit: bigint; credit: bigint }> {
+  if (entries.length < 2) {
+    throw new BadRequestException('Ledger transaction must have at least two entries');
+  }
+
   const totals = new Map<string, { debit: bigint; credit: bigint }>();
 
   for (const entry of entries) {
@@ -78,12 +103,7 @@ export function assertBalancedLedgerEntries(entries: LedgerBalanceEntry[]): void
 
     totals.set(entry.assetId, current);
   }
-
-  for (const [assetId, total] of totals.entries()) {
-    if (total.debit !== total.credit) {
-      throw new BadRequestException(`Ledger transaction is not balanced for asset ${assetId}`);
-    }
-  }
+  return totals;
 }
 
 export function calculateAccountBalance(entries: LedgerBalanceEntry[]): Prisma.Decimal {

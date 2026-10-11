@@ -9,7 +9,10 @@ import {
   ReconciliationType,
 } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
-import { assertBalancedLedgerEntries } from '../ledger/ledger.validator';
+import {
+  assertBalancedLedgerEntries,
+  getLedgerAtomicImbalances,
+} from '../ledger/ledger.validator';
 import { TreasuryService } from '../treasury/treasury.service';
 import { HyperliquidExecutionService } from '../hyperliquid/hyperliquid-execution.service';
 import { calculateAccountBalance } from '../ledger/ledger.validator';
@@ -66,11 +69,20 @@ export class ReconciliationService {
       });
 
       const failedTransactionIds: string[] = [];
+      const legacyRoundingTransactionIds: string[] = [];
       for (const transaction of transactions) {
         try {
           assertBalancedLedgerEntries(transaction.entries);
         } catch (_error) {
-          failedTransactionIds.push(transaction.id);
+          const imbalances = getLedgerAtomicImbalances(transaction.entries);
+          const roundingOnly = [...imbalances.values()].every(
+            (imbalance) => (imbalance < 0n ? -imbalance : imbalance) <= 1n,
+          );
+          if (roundingOnly) {
+            legacyRoundingTransactionIds.push(transaction.id);
+          } else {
+            failedTransactionIds.push(transaction.id);
+          }
         }
       }
 
@@ -85,6 +97,7 @@ export class ReconciliationService {
           details: {
             checkedTransactions: transactions.length,
             failedTransactionIds,
+            legacyRoundingTransactionIds,
           },
         },
       });

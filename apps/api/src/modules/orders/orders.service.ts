@@ -2021,7 +2021,10 @@ export class OrdersService {
           });
         });
       } else if (snapshot.status === 'FILLED') {
-        await this.releaseUnfilledProviderMargin(providerOrder.order);
+        await this.releaseUnfilledProviderMargin({
+          ...order,
+          market: providerOrder.order.market,
+        });
         await this.prisma.$transaction(async (tx) => {
           await tx.providerOrder.update({
             where: { id: providerOrder.id },
@@ -2045,7 +2048,10 @@ export class OrdersService {
           });
         });
       } else {
-        await this.releaseUnfilledProviderMargin(providerOrder.order);
+        await this.releaseUnfilledProviderMargin({
+          ...order,
+          market: providerOrder.order.market,
+        });
         await this.prisma.$transaction(async (tx) => {
           await tx.providerOrder.update({
             where: { id: providerOrder.id },
