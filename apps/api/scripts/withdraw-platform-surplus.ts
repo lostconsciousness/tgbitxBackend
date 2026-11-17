@@ -54,8 +54,8 @@ async function main() {
   const recipient = getAddress(argument('recipient'));
   const amount = new Prisma.Decimal(argument('amount'));
   const operationId = argument('operation-id');
-  if (!amount.isInteger() || amount.lessThan(170) || amount.greaterThan(200)) {
-    throw new Error('Amount must be an integer between 170 and 200 USDC');
+  if (!amount.isInteger() || amount.lessThan(100) || amount.greaterThan(200)) {
+    throw new Error('Amount must be an integer between 100 and 200 USDC');
   }
   if (!/^[a-z0-9-]{8,80}$/i.test(operationId)) {
     throw new Error('Operation id must contain only letters, numbers and hyphens');
@@ -137,12 +137,15 @@ async function main() {
     })));
     const perSource = amount.dividedBy(sourceStates.length);
     if (!perSource.isInteger()) throw new Error('Amount must split evenly across custody sources');
+    const blockingReasons: string[] = [];
     for (const state of sourceStates) {
       if (state.usdc.minus(perSource).lessThan(PER_SOURCE_RESERVE)) {
-        throw new Error(`${state.source.role} would fall below ${PER_SOURCE_RESERVE.toString()} USDC`);
+        blockingReasons.push(
+          `${state.source.role} would fall below ${PER_SOURCE_RESERVE.toString()} USDC`,
+        );
       }
       if (state.nativeWei < 50_000_000_000_000n) {
-        throw new Error(`${state.source.role} has less than 0.00005 ETH for Arbitrum gas`);
+        blockingReasons.push(`${state.source.role} has less than 0.00005 ETH for Arbitrum gas`);
       }
     }
 
@@ -178,6 +181,7 @@ async function main() {
       include: { network: true },
     });
     let physicalCustodyUsdc = new Prisma.Decimal(0);
+    const unavailableAuditNetworks: string[] = [];
     for (const token of contracts) {
       const accounts = await prisma.custodyAccount.findMany({
         where: {
@@ -186,18 +190,24 @@ async function main() {
         },
       });
       for (const account of accounts) {
-        const balance = await rpc.getBalance(
-          account.address,
-          token.address!,
-          token.network.chainKey,
-          token.decimals,
-        );
-        physicalCustodyUsdc = physicalCustodyUsdc.plus(balance.value);
+        try {
+          const balance = await rpc.getBalance(
+            account.address,
+            token.address!,
+            token.network.chainKey,
+            token.decimals,
+          );
+          physicalCustodyUsdc = physicalCustodyUsdc.plus(balance.value);
+        } catch (error) {
+          unavailableAuditNetworks.push(token.network.chainKey);
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 350));
       }
     }
     const surplusAfter = physicalCustodyUsdc.minus(liabilities).minus(amount);
     if (surplusAfter.lessThan(GLOBAL_SURPLUS_RESERVE)) {
-      throw new Error(
+      blockingReasons.push(
         `Global USDC surplus after withdrawal would be ${surplusAfter.toString()}, below ${GLOBAL_SURPLUS_RESERVE.toString()}`,
       );
     }
@@ -223,11 +233,16 @@ async function main() {
       })),
       liabilities: liabilities.toString(),
       physicalCustodyUsdc: physicalCustodyUsdc.toString(),
+      unavailableAuditNetworks: [...new Set(unavailableAuditNetworks)],
       surplusAfter: surplusAfter.toString(),
       recipientBefore: recipientBefore.toString(),
+      blockingReasons,
     };
     console.log(JSON.stringify(report, null, 2));
     if (mode === 'dry-run') return;
+    if (blockingReasons.length > 0) {
+      throw new Error(`Refusing surplus withdrawal: ${blockingReasons.join('; ')}`);
+    }
 
     custody.assertSafeAuthorizationConfiguration(CHAIN_ID);
     const transfers = [];
